@@ -1,0 +1,2011 @@
+---
+description: "PCRemote Windows 서버 프로그램 구현 가이드 (C# .NET 기반)"
+globs:
+alwaysApply: false
+---
+
+# PCRemote Windows 서버 프로그램 구현 가이드 (C# .NET)
+
+**버전**: v0.1  
+**작성일**: 2025-01-16  
+**대상**: PCRemote 프로젝트 Windows 서버 프로그램 개발  
+**기술 스택**: C# .NET 6+ 기반
+
+## 목차
+
+- 1. 개요 및 역할
+- 2. 기술 스택 및 아키텍처
+- 3. 핵심 기능 구현 가이드
+  - 3.1 매크로 시스템
+  - 3.2 UI 상태 제어
+  - 3.3 HID 입력 확장
+  - 3.4 통신 인터페이스
+- 4. 공식 문서 예제 코드
+- 5. 프로젝트 구조 및 빌드
+- 6. 테스트 및 트러블슈팅
+- 7. 보안 및 권한 관리
+
+---
+
+## 1. 개요 및 역할
+
+### 1.1 서버 프로그램의 목적
+
+PCRemote Windows 서버 프로그램은 ESP32-S3 HID 동글로 제공되는 기본 마우스/키보드 입력을 확장하여 고급 기능을 제공하는 .NET 기반 Windows Service입니다.
+
+### 1.2 주요 역할
+
+- **매크로 실행**: 복잡한 키 시퀀스 및 사용자 정의 매크로 처리
+- **UI 상태 제어**: 애플리케이션 창 상태 관리 및 Android 앱과의 상태 동기화
+- **HID 입력 보완**: 기본 HID 기능으로 처리하기 어려운 고급 입력 처리
+- **시스템 통합**: Windows API와의 통합을 통한 확장 기능 제공
+
+### 1.3 아키텍처 위치
+
+```
+Android App ←→ ESP32-S3 (HID) ←→ Windows PC
+                                      ↓
+                               .NET Windows Service
+                               (Background Service)
+```
+
+---
+
+## 2. 기술 스택 및 아키텍처
+
+### 2.1 개발 환경
+
+- **언어**: C# 11+ (.NET 6 이상)
+- **플랫폼**: Windows 10/11 (x64)
+- **IDE**: Visual Studio 2022 또는 VS Code (권장)
+- **빌드 시스템**: .NET CLI + MSBuild
+
+### 2.2 핵심 패키지
+
+#### 2.2.1 필수 NuGet 패키지
+```xml
+<PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="7.0.0" />
+<PackageReference Include="Microsoft.Extensions.Logging" Version="7.0.0" />
+<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+<PackageReference Include="System.IO.Pipes" Version="7.0.0" />
+```
+
+#### 2.2.2 Win32 API 호출
+- P/Invoke를 통한 필요한 Windows API 접근
+- System.Runtime.InteropServices 활용
+
+### 2.3 시스템 아키텍처
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Android App   │    │   ESP32-S3      │    │  Windows PC     │
+│                 │◄──►│   (HID Bridge)  │◄──►│ + .NET Service  │
+│ - UI Control    │    │ - Basic HID     │    │ - Macro Engine  │
+│ - State Sync    │    │ - Protocol      │    │ - UI Control    │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+                                                       │
+                                               ┌─────────────────┐
+                                               │ .NET + Win32    │
+                                               │ - P/Invoke      │
+                                               │ - Windows APIs  │
+                                               │ - Named Pipes   │
+                                               └─────────────────┘
+```
+
+---
+
+## 3. 핵심 기능 구현 가이드
+
+### 3.1 매크로 시스템
+
+#### 3.1.1 매크로 엔진 기본 구조
+
+```csharp
+/// <summary>
+/// 매크로 실행 엔진
+/// 
+/// Android 앱으로부터 MACRO_START_REQUEST 신호를 받아 
+/// 사전 정의된 매크로를 실행하고 TASK_COMPLETED 신호를 반환합니다.
+/// </summary>
+public class MacroEngine
+{
+    private readonly Dictionary<uint, MacroDefinition> _macros = new();
+    private volatile bool _isExecuting = false;
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
+    private readonly ILogger<MacroEngine> _logger;
+
+    public MacroEngine(ILogger<MacroEngine> logger)
+    {
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// 매크로 엔진 초기화
+    /// </summary>
+    public async Task<bool> InitializeAsync()
+    {
+        try
+        {
+            await LoadMacroDefinitionsAsync();
+            _logger.LogInformation("매크로 엔진이 성공적으로 초기화되었습니다.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "매크로 엔진 초기화 실패");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 매크로 실행
+    /// </summary>
+    /// <param name="macroId">실행할 매크로 ID</param>
+    /// <param name="cancellationToken">취소 토큰</param>
+    public async Task<bool> ExecuteMacroAsync(uint macroId, CancellationToken cancellationToken = default)
+    {
+        if (_isExecuting)
+        {
+            _logger.LogWarning("다른 매크로가 실행 중입니다.");
+            return false;
+        }
+
+        if (!_macros.TryGetValue(macroId, out var macro))
+        {
+            _logger.LogError("매크로 ID {MacroId}를 찾을 수 없습니다.", macroId);
+            return false;
+        }
+
+        _isExecuting = true;
+        try
+        {
+            await ExecuteMacroInternalAsync(macro, cancellationToken);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("매크로 실행이 취소되었습니다.");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "매크로 실행 중 오류 발생");
+            return false;
+        }
+        finally
+        {
+            _isExecuting = false;
+        }
+    }
+
+    /// <summary>
+    /// 실행 중인 매크로 중단
+    /// </summary>
+    public void CancelMacro()
+    {
+        _cancellationTokenSource.Cancel();
+    }
+
+    private async Task LoadMacroDefinitionsAsync()
+    {
+        // 설정 파일에서 매크로 정의 로드
+        var configPath = Path.Combine(AppContext.BaseDirectory, "macros.json");
+        if (File.Exists(configPath))
+        {
+            var json = await File.ReadAllTextAsync(configPath);
+            var macros = JsonConvert.DeserializeObject<List<MacroDefinition>>(json);
+            
+            foreach (var macro in macros ?? new List<MacroDefinition>())
+            {
+                _macros[macro.Id] = macro;
+            }
+        }
+    }
+}
+```
+
+#### 3.1.2 SendInput을 활용한 키 입력 구현
+
+```csharp
+/// <summary>
+/// SendInput API를 사용한 키보드 입력 시뮬레이션
+/// 
+/// Windows의 SendInput API를 사용하여 안전하고 정확한 키 입력을 구현합니다.
+/// P/Invoke를 통해 Win32 API를 직접 호출합니다.
+/// </summary>
+public static class KeyboardSimulator
+{
+    // Win32 API 상수
+    private const int INPUT_KEYBOARD = 1;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const uint KEYEVENTF_UNICODE = 0x0004;
+
+    // Win32 API 구조체
+    [StructLayout(LayoutKind.Sequential)]
+    private struct INPUT
+    {
+        public int type;
+        public InputUnion u;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct InputUnion
+    {
+        [FieldOffset(0)]
+        public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KEYBDINPUT
+    {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    // Win32 API 함수
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    /// <summary>
+    /// 단일 키 입력 시뮬레이션
+    /// </summary>
+    /// <param name="vkCode">가상 키 코드 (VK_*)</param>
+    /// <param name="isKeyDown">true: 키 다운, false: 키 업</param>
+    public static bool SendKey(ushort vkCode, bool isKeyDown)
+    {
+        var input = new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            u = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = vkCode,
+                    dwFlags = isKeyDown ? 0 : KEYEVENTF_KEYUP
+                }
+            }
+        };
+
+        uint result = SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
+        return result == 1;
+    }
+
+    /// <summary>
+    /// 키 조합 입력 (예: Ctrl+C)
+    /// </summary>
+    /// <param name="modifiers">수정자 키 (VK_CONTROL, VK_SHIFT, VK_MENU)</param>
+    /// <param name="key">주 키 코드</param>
+    public static bool SendKeyCombo(ushort[] modifiers, ushort key)
+    {
+        var inputs = new List<INPUT>();
+
+        // 수정자 키 다운
+        foreach (var modifier in modifiers)
+        {
+            inputs.Add(CreateKeyInput(modifier, false));
+        }
+
+        // 주 키 다운
+        inputs.Add(CreateKeyInput(key, false));
+
+        // 주 키 업
+        inputs.Add(CreateKeyInput(key, true));
+
+        // 수정자 키 업 (역순)
+        for (int i = modifiers.Length - 1; i >= 0; i--)
+        {
+            inputs.Add(CreateKeyInput(modifiers[i], true));
+        }
+
+        uint result = SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+        return result == inputs.Count;
+    }
+
+    /// <summary>
+    /// 텍스트 입력 (유니코드 지원)
+    /// </summary>
+    /// <param name="text">입력할 텍스트</param>
+    public static bool SendText(string text)
+    {
+        var inputs = new List<INPUT>();
+
+        foreach (char c in text)
+        {
+            // 키 다운
+            inputs.Add(new INPUT
+            {
+                type = INPUT_KEYBOARD,
+                u = new InputUnion
+                {
+                    ki = new KEYBDINPUT
+                    {
+                        wScan = c,
+                        dwFlags = KEYEVENTF_UNICODE
+                    }
+                }
+            });
+
+            // 키 업
+            inputs.Add(new INPUT
+            {
+                type = INPUT_KEYBOARD,
+                u = new InputUnion
+                {
+                    ki = new KEYBDINPUT
+                    {
+                        wScan = c,
+                        dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                    }
+                }
+            });
+        }
+
+        uint result = SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf<INPUT>());
+        return result == inputs.Count;
+    }
+
+    private static INPUT CreateKeyInput(ushort vkCode, bool isKeyUp)
+    {
+        return new INPUT
+        {
+            type = INPUT_KEYBOARD,
+            u = new InputUnion
+            {
+                ki = new KEYBDINPUT
+                {
+                    wVk = vkCode,
+                    dwFlags = isKeyUp ? KEYEVENTF_KEYUP : 0
+                }
+            }
+        };
+    }
+}
+
+/// <summary>
+/// 가상 키 코드 상수
+/// </summary>
+public static class VirtualKeyCodes
+{
+    public const ushort VK_CONTROL = 0x11;
+    public const ushort VK_SHIFT = 0x10;
+    public const ushort VK_MENU = 0x12;  // Alt 키
+    public const ushort VK_ESCAPE = 0x1B;
+    public const ushort VK_SPACE = 0x20;
+    public const ushort VK_RETURN = 0x0D;
+    public const ushort VK_TAB = 0x09;
+    
+    // 문자 키
+    public const ushort VK_A = 0x41;
+    public const ushort VK_C = 0x43;
+    public const ushort VK_V = 0x56;
+    public const ushort VK_X = 0x58;
+    public const ushort VK_Z = 0x5A;
+}
+```
+
+#### 3.1.3 매크로 정의 구조
+
+```csharp
+/// <summary>
+/// 매크로 액션 타입 정의
+/// </summary>
+public enum MacroActionType
+{
+    KeyPress,           // 단일 키 입력
+    KeyCombo,           // 키 조합 (Ctrl+C 등)
+    TextInput,          // 텍스트 입력
+    Delay,              // 지연
+    MouseClick,         // 마우스 클릭
+    MouseMove,          // 마우스 이동
+    WindowOperation     // 창 조작 (최소화, 최대화 등)
+}
+
+/// <summary>
+/// 매크로 액션 데이터
+/// </summary>
+public class MacroActionData
+{
+    public uint? KeyCode { get; set; }              // 키 코드
+    public ushort[]? ModifierKeys { get; set; }     // 수정자 키 배열
+    public string? Text { get; set; }               // 텍스트
+    public int? DelayMs { get; set; }               // 지연 시간 (밀리초)
+    public Point? Coordinates { get; set; }         // 좌표
+    public string? WindowOperation { get; set; }    // 창 조작 타입
+}
+
+/// <summary>
+/// 매크로 액션
+/// </summary>
+public class MacroAction
+{
+    public MacroActionType Type { get; set; }
+    public MacroActionData Data { get; set; } = new();
+}
+
+/// <summary>
+/// 매크로 정의
+/// </summary>
+public class MacroDefinition
+{
+    public uint Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+    public List<MacroAction> Actions { get; set; } = new();
+    public bool IsLooping { get; set; } = false;        // 반복 실행 여부
+    public uint LoopCount { get; set; } = 1;             // 반복 횟수 (0 = 무한)
+}
+
+/// <summary>
+/// 좌표 구조체
+/// </summary>
+public struct Point
+{
+    public int X { get; set; }
+    public int Y { get; set; }
+
+    public Point(int x, int y)
+    {
+        X = x;
+        Y = y;
+    }
+}
+```
+
+### 3.2 UI 상태 제어
+
+#### 3.2.1 창 상태 관리
+
+```csharp
+/// <summary>
+/// Windows 창 상태 제어 클래스
+/// 
+/// Android 앱의 요청에 따라 특정 창을 비활성화(Disabled)하거나
+/// 강제 활성화(Force Enable)하는 기능을 제공합니다.
+/// </summary>
+public class WindowStateController
+{
+    private readonly HashSet<IntPtr> _disabledWindows = new();
+    private readonly ILogger<WindowStateController> _logger;
+
+    // Win32 API 함수들
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnableWindow(IntPtr hWnd, bool bEnable);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetFocus(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    public WindowStateController(ILogger<WindowStateController> logger)
+    {
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// 창 비활성화
+    /// </summary>
+    /// <param name="hwnd">대상 창 핸들</param>
+    /// <returns>성공 여부</returns>
+    public bool DisableWindow(IntPtr hwnd)
+    {
+        if (!IsWindow(hwnd))
+        {
+            _logger.LogWarning("유효하지 않은 창 핸들: {Handle}", hwnd);
+            return false;
+        }
+
+        try
+        {
+            // 창을 비활성화하고 그레이 아웃 효과 적용
+            bool result = EnableWindow(hwnd, false);
+            
+            if (result)
+            {
+                // 상태 저장 (복원용)
+                _disabledWindows.Add(hwnd);
+                _logger.LogInformation("창 비활성화 완료: {Handle}", hwnd);
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "창 비활성화 중 오류 발생: {Handle}", hwnd);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 창 강제 활성화
+    /// </summary>
+    /// <param name="hwnd">대상 창 핸들</param>
+    /// <returns>성공 여부</returns>
+    public bool ForceEnableWindow(IntPtr hwnd)
+    {
+        if (!IsWindow(hwnd))
+        {
+            _logger.LogWarning("유효하지 않은 창 핸들: {Handle}", hwnd);
+            return false;
+        }
+
+        try
+        {
+            bool result = EnableWindow(hwnd, true);
+            
+            if (result)
+            {
+                // 창을 최전면으로 가져오기
+                SetForegroundWindow(hwnd);
+                SetFocus(hwnd);
+
+                // 비활성화 목록에서 제거
+                _disabledWindows.Remove(hwnd);
+                _logger.LogInformation("창 강제 활성화 완료: {Handle}", hwnd);
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "창 강제 활성화 중 오류 발생: {Handle}", hwnd);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 모든 비활성화된 창 복원
+    /// </summary>
+    public void RestoreAllWindows()
+    {
+        var windowsToRestore = _disabledWindows.ToList();
+        
+        foreach (var hwnd in windowsToRestore)
+        {
+            if (IsWindow(hwnd))
+            {
+                EnableWindow(hwnd, true);
+                _logger.LogInformation("창 복원: {Handle}", hwnd);
+            }
+        }
+        
+        _disabledWindows.Clear();
+        _logger.LogInformation("모든 창 복원 완료");
+    }
+
+    /// <summary>
+    /// 현재 활성 창 정보 가져오기
+    /// </summary>
+    /// <returns>창 정보</returns>
+    public WindowInfo? GetActiveWindowInfo()
+    {
+        try
+        {
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero)
+                return null;
+
+            var titleBuilder = new StringBuilder(256);
+            GetWindowText(hwnd, titleBuilder, titleBuilder.Capacity);
+
+            return new WindowInfo
+            {
+                Handle = hwnd,
+                Title = titleBuilder.ToString(),
+                IsEnabled = !_disabledWindows.Contains(hwnd)
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "활성 창 정보 조회 중 오류 발생");
+            return null;
+        }
+    }
+}
+
+/// <summary>
+/// 창 정보 구조체
+/// </summary>
+public class WindowInfo
+{
+    public IntPtr Handle { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public bool IsEnabled { get; set; }
+}
+```
+
+#### 3.2.2 윈도우 후킹을 통한 상태 모니터링
+
+```csharp
+/// <summary>
+/// 시스템 이벤트 모니터링
+/// 
+/// SetWindowsHookEx를 사용하여 시스템 이벤트를 모니터링하고
+/// Android 앱에 상태 변경을 알립니다.
+/// </summary>
+public class SystemEventMonitor : IDisposable
+{
+    private readonly ILogger<SystemEventMonitor> _logger;
+    private IntPtr _windowHook = IntPtr.Zero;
+    private readonly LowLevelProc _hookProcDelegate;
+    private bool _disposed = false;
+
+    // 이벤트 핸들러
+    public event EventHandler<WindowEventArgs>? WindowCreated;
+    public event EventHandler<WindowEventArgs>? WindowDestroyed;
+    public event EventHandler<WindowEventArgs>? WindowActivated;
+
+    // Win32 API 함수들
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    // Hook 관련 상수
+    private const int WH_SHELL = 10;
+    private const int HSHELL_WINDOWCREATED = 1;
+    private const int HSHELL_WINDOWDESTROYED = 2;
+    private const int HSHELL_ACTIVATESHELLWINDOW = 3;
+
+    // 델리게이트 정의
+    private delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    public SystemEventMonitor(ILogger<SystemEventMonitor> logger)
+    {
+        _logger = logger;
+        _hookProcDelegate = HookCallback;
+    }
+
+    /// <summary>
+    /// 모니터링 시작
+    /// </summary>
+    public bool StartMonitoring()
+    {
+        try
+        {
+            using (var currentProcess = Process.GetCurrentProcess())
+            using (var currentModule = currentProcess.MainModule)
+            {
+                var moduleHandle = GetModuleHandle(currentModule?.ModuleName);
+                
+                _windowHook = SetWindowsHookEx(
+                    WH_SHELL,
+                    _hookProcDelegate,
+                    moduleHandle,
+                    0
+                );
+
+                if (_windowHook == IntPtr.Zero)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    _logger.LogError("윈도우 후킹 설정 실패. 오류 코드: {ErrorCode}", error);
+                    return false;
+                }
+
+                _logger.LogInformation("시스템 이벤트 모니터링 시작");
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "모니터링 시작 중 오류 발생");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 모니터링 중단
+    /// </summary>
+    public void StopMonitoring()
+    {
+        if (_windowHook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_windowHook);
+            _windowHook = IntPtr.Zero;
+            _logger.LogInformation("시스템 이벤트 모니터링 중단");
+        }
+    }
+
+    /// <summary>
+    /// 윈도우 이벤트 처리 콜백
+    /// </summary>
+    private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        try
+        {
+            if (nCode >= 0)
+            {
+                var eventArgs = new WindowEventArgs { WindowHandle = lParam };
+
+                switch (wParam.ToInt32())
+                {
+                    case HSHELL_WINDOWCREATED:
+                        _logger.LogDebug("새 창 생성됨: {Handle}", lParam);
+                        WindowCreated?.Invoke(this, eventArgs);
+                        break;
+
+                    case HSHELL_WINDOWDESTROYED:
+                        _logger.LogDebug("창 소멸됨: {Handle}", lParam);
+                        WindowDestroyed?.Invoke(this, eventArgs);
+                        break;
+
+                    case HSHELL_ACTIVATESHELLWINDOW:
+                        _logger.LogDebug("창 활성화됨: {Handle}", lParam);
+                        WindowActivated?.Invoke(this, eventArgs);
+                        break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "후킹 콜백 처리 중 오류 발생");
+        }
+
+        return CallNextHookEx(_windowHook, nCode, wParam, lParam);
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            StopMonitoring();
+            _disposed = true;
+        }
+    }
+}
+
+/// <summary>
+/// 윈도우 이벤트 인자
+/// </summary>
+public class WindowEventArgs : EventArgs
+{
+    public IntPtr WindowHandle { get; set; }
+}
+```
+
+### 3.3 HID 입력 확장
+
+#### 3.3.1 Raw Input을 통한 HID 모니터링
+
+```csharp
+/// <summary>
+/// Raw Input을 통한 HID 장치 모니터링
+/// 
+/// ESP32-S3 HID 동글의 입력을 모니터링하고 필요시 확장 처리를 수행합니다.
+/// </summary>
+public class HidInputMonitor : IDisposable
+{
+    private readonly ILogger<HidInputMonitor> _logger;
+    private bool _isMonitoring = false;
+    private bool _disposed = false;
+
+    // 이벤트 핸들러
+    public event EventHandler<MouseInputEventArgs>? MouseInputReceived;
+    public event EventHandler<KeyboardInputEventArgs>? KeyboardInputReceived;
+
+    // Win32 API 함수들
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] pRawInputDevices, uint uiNumDevices, uint cbSize);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetRawInputData(IntPtr hRawInput, uint uiCommand, IntPtr pData, ref uint pcbSize, uint cbSizeHeader);
+
+    // Raw Input 관련 상수
+    private const uint RID_INPUT = 0x10000003;
+    private const uint RIM_TYPEMOUSE = 0;
+    private const uint RIM_TYPEKEYBOARD = 1;
+    private const uint RIDEV_INPUTSINK = 0x00000100;
+
+    // Raw Input 구조체들
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTDEVICE
+    {
+        public ushort usUsagePage;
+        public ushort usUsage;
+        public uint dwFlags;
+        public IntPtr hwndTarget;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTHEADER
+    {
+        public uint dwType;
+        public uint dwSize;
+        public IntPtr hDevice;
+        public IntPtr wParam;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWMOUSE
+    {
+        public ushort usFlags;
+        public ushort usButtonFlags;
+        public ushort usButtonData;
+        public uint ulRawButtons;
+        public int lLastX;
+        public int lLastY;
+        public uint ulExtraInformation;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWKEYBOARD
+    {
+        public ushort MakeCode;
+        public ushort Flags;
+        public ushort Reserved;
+        public ushort VKey;
+        public uint Message;
+        public uint ExtraInformation;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct RAWINPUT
+    {
+        [FieldOffset(0)]
+        public RAWINPUTHEADER header;
+        [FieldOffset(24)]
+        public RAWMOUSE mouse;
+        [FieldOffset(24)]
+        public RAWKEYBOARD keyboard;
+    }
+
+    public HidInputMonitor(ILogger<HidInputMonitor> logger)
+    {
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Raw Input 등록 및 모니터링 시작
+    /// </summary>
+    /// <param name="targetWindowHandle">대상 윈도우 핸들</param>
+    public bool StartMonitoring(IntPtr targetWindowHandle)
+    {
+        try
+        {
+            var devices = new RAWINPUTDEVICE[2];
+
+            // 마우스 등록
+            devices[0] = new RAWINPUTDEVICE
+            {
+                usUsagePage = 0x01,         // Generic Desktop
+                usUsage = 0x02,             // Mouse
+                dwFlags = RIDEV_INPUTSINK,
+                hwndTarget = targetWindowHandle
+            };
+
+            // 키보드 등록
+            devices[1] = new RAWINPUTDEVICE
+            {
+                usUsagePage = 0x01,         // Generic Desktop
+                usUsage = 0x06,             // Keyboard
+                dwFlags = RIDEV_INPUTSINK,
+                hwndTarget = targetWindowHandle
+            };
+
+            bool result = RegisterRawInputDevices(devices, 2, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
+            
+            if (!result)
+            {
+                int error = Marshal.GetLastWin32Error();
+                _logger.LogError("Raw Input 등록 실패. 오류 코드: {ErrorCode}", error);
+                return false;
+            }
+
+            _isMonitoring = true;
+            _logger.LogInformation("HID 입력 모니터링 시작");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "HID 모니터링 시작 중 오류 발생");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// WM_INPUT 메시지 처리
+    /// </summary>
+    /// <param name="lParam">메시지 매개변수</param>
+    public void ProcessRawInput(IntPtr lParam)
+    {
+        try
+        {
+            uint dwSize = 0;
+            GetRawInputData(lParam, RID_INPUT, IntPtr.Zero, ref dwSize, (uint)Marshal.SizeOf<RAWINPUTHEADER>());
+
+            if (dwSize == 0)
+                return;
+
+            IntPtr buffer = Marshal.AllocHGlobal((int)dwSize);
+            try
+            {
+                uint result = GetRawInputData(lParam, RID_INPUT, buffer, ref dwSize, (uint)Marshal.SizeOf<RAWINPUTHEADER>());
+                
+                if (result != dwSize)
+                    return;
+
+                var raw = Marshal.PtrToStructure<RAWINPUT>(buffer);
+
+                switch (raw.header.dwType)
+                {
+                    case RIM_TYPEMOUSE:
+                        ProcessMouseInput(raw.mouse);
+                        break;
+                    case RIM_TYPEKEYBOARD:
+                        ProcessKeyboardInput(raw.keyboard);
+                        break;
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Raw Input 처리 중 오류 발생");
+        }
+    }
+
+    private void ProcessMouseInput(RAWMOUSE mouse)
+    {
+        // ESP32-S3 동글로부터의 마우스 입력 확장 처리
+        var eventArgs = new MouseInputEventArgs
+        {
+            Flags = mouse.usFlags,
+            ButtonFlags = mouse.usButtonFlags,
+            DeltaX = mouse.lLastX,
+            DeltaY = mouse.lLastY,
+            ButtonData = mouse.usButtonData
+        };
+
+        MouseInputReceived?.Invoke(this, eventArgs);
+        
+        // 제스처 인식, 스크롤 가속 등의 확장 처리
+        ProcessMouseGestures(eventArgs);
+    }
+
+    private void ProcessKeyboardInput(RAWKEYBOARD keyboard)
+    {
+        // ESP32-S3 동글로부터의 키보드 입력 확장 처리
+        var eventArgs = new KeyboardInputEventArgs
+        {
+            VirtualKey = keyboard.VKey,
+            ScanCode = keyboard.MakeCode,
+            Flags = keyboard.Flags,
+            Message = keyboard.Message
+        };
+
+        KeyboardInputReceived?.Invoke(this, eventArgs);
+
+        // 특수 키 조합 감지, 매크로 트리거 등의 확장 처리
+        ProcessKeyboardShortcuts(eventArgs);
+    }
+
+    private void ProcessMouseGestures(MouseInputEventArgs args)
+    {
+        // 제스처 인식 로직 구현
+        // 예: 빠른 스크롤 감지, 드래그 패턴 인식 등
+    }
+
+    private void ProcessKeyboardShortcuts(KeyboardInputEventArgs args)
+    {
+        // 단축키 조합 감지 로직 구현
+        // 예: 특수 매크로 트리거 키 조합 감지
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            if (_isMonitoring)
+            {
+                // Raw Input 등록 해제는 프로세스 종료 시 자동으로 처리됨
+                _isMonitoring = false;
+                _logger.LogInformation("HID 입력 모니터링 중단");
+            }
+            _disposed = true;
+        }
+    }
+}
+
+/// <summary>
+/// 마우스 입력 이벤트 인자
+/// </summary>
+public class MouseInputEventArgs : EventArgs
+{
+    public ushort Flags { get; set; }
+    public ushort ButtonFlags { get; set; }
+    public ushort ButtonData { get; set; }
+    public int DeltaX { get; set; }
+    public int DeltaY { get; set; }
+}
+
+/// <summary>
+/// 키보드 입력 이벤트 인자
+/// </summary>
+public class KeyboardInputEventArgs : EventArgs
+{
+    public ushort VirtualKey { get; set; }
+    public ushort ScanCode { get; set; }
+    public ushort Flags { get; set; }
+    public uint Message { get; set; }
+}
+```
+
+### 3.4 통신 인터페이스
+
+#### 3.4.1 Named Pipe 서버 구현
+
+```csharp
+/// <summary>
+/// Named Pipe를 통한 Android 앱과의 통신
+/// 
+/// Android 앱이 USB를 통해 ESP32-S3과 통신하는 것과 별도로,
+/// 고급 기능을 위해 서버와 직접 통신할 수 있는 채널을 제공합니다.
+/// </summary>
+public class CommunicationServer : IDisposable
+{
+    private readonly ILogger<CommunicationServer> _logger;
+    private NamedPipeServerStream? _pipeServer;
+    private readonly CancellationTokenSource _cancellationTokenSource = new();
+    private bool _disposed = false;
+
+    // 이벤트 핸들러
+    public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
+    public event EventHandler? ClientConnected;
+    public event EventHandler? ClientDisconnected;
+
+    private const string PipeName = "PCRemoteServer";
+    private const int BufferSize = 4096;
+
+    public CommunicationServer(ILogger<CommunicationServer> logger)
+    {
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// 서버 시작
+    /// </summary>
+    public async Task<bool> StartAsync()
+    {
+        try
+        {
+            _pipeServer = new NamedPipeServerStream(
+                PipeName,
+                PipeDirection.InOut,
+                1, // 최대 인스턴스 수
+                PipeTransmissionMode.Message,
+                PipeOptions.Asynchronous,
+                BufferSize,
+                BufferSize
+            );
+
+            _logger.LogInformation("Named Pipe 서버 시작: {PipeName}", PipeName);
+
+            // 비동기로 클라이언트 연결 대기
+            await WaitForConnectionAsync();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "서버 시작 중 오류 발생");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 클라이언트 연결 대기
+    /// </summary>
+    private async Task WaitForConnectionAsync()
+    {
+        try
+        {
+            while (!_cancellationTokenSource.Token.IsCancellationRequested)
+            {
+                _logger.LogInformation("클라이언트 연결 대기 중...");
+                
+                await _pipeServer!.WaitForConnectionAsync(_cancellationTokenSource.Token);
+                
+                _logger.LogInformation("클라이언트 연결됨");
+                ClientConnected?.Invoke(this, EventArgs.Empty);
+
+                // 메시지 수신 처리
+                await HandleClientAsync();
+
+                // 연결 해제
+                _pipeServer.Disconnect();
+                _logger.LogInformation("클라이언트 연결 해제됨");
+                ClientDisconnected?.Invoke(this, EventArgs.Empty);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("서버 종료 요청됨");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "클라이언트 연결 처리 중 오류 발생");
+        }
+    }
+
+    /// <summary>
+    /// 클라이언트 메시지 처리
+    /// </summary>
+    private async Task HandleClientAsync()
+    {
+        var buffer = new byte[BufferSize];
+        
+        try
+        {
+            while (_pipeServer!.IsConnected && !_cancellationTokenSource.Token.IsCancellationRequested)
+            {
+                int bytesRead = await _pipeServer.ReadAsync(buffer, 0, buffer.Length, _cancellationTokenSource.Token);
+                
+                if (bytesRead > 0)
+                {
+                    string message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    _logger.LogDebug("메시지 수신: {Message}", message);
+                    
+                    MessageReceived?.Invoke(this, new MessageReceivedEventArgs { Message = message });
+                    
+                    // 메시지 처리
+                    await ProcessMessageAsync(message);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "메시지 처리 중 오류 발생");
+        }
+    }
+
+    /// <summary>
+    /// 수신된 메시지 처리
+    /// </summary>
+    private async Task ProcessMessageAsync(string message)
+    {
+        try
+        {
+            // JSON 메시지 파싱
+            var messageObject = JsonConvert.DeserializeObject<Dictionary<string, object>>(message);
+            
+            if (messageObject != null && messageObject.TryGetValue("command", out var command))
+            {
+                string? commandStr = command.ToString();
+                
+                switch (commandStr)
+                {
+                    case "MACRO_START_REQUEST":
+                        await HandleMacroRequestAsync(messageObject);
+                        break;
+                    case "UI_DISABLE_REQUEST":
+                        await HandleUIDisableRequestAsync(messageObject);
+                        break;
+                    case "UI_FORCE_ENABLE_REQUEST":
+                        await HandleUIForceEnableRequestAsync(messageObject);
+                        break;
+                    default:
+                        _logger.LogWarning("알 수 없는 명령: {Command}", commandStr);
+                        break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "메시지 처리 중 오류: {Message}", message);
+        }
+    }
+
+    /// <summary>
+    /// 매크로 실행 요청 처리
+    /// </summary>
+    private async Task HandleMacroRequestAsync(Dictionary<string, object> message)
+    {
+        if (message.TryGetValue("macroId", out var macroIdObj) && uint.TryParse(macroIdObj.ToString(), out uint macroId))
+        {
+            // 매크로 실행 로직
+            bool success = await ExecuteMacroAsync(macroId);
+            
+            // 응답 전송
+            await SendResponseAsync(new { command = "TASK_COMPLETED", macroId, success });
+        }
+    }
+
+    /// <summary>
+    /// UI 비활성화 요청 처리
+    /// </summary>
+    private async Task HandleUIDisableRequestAsync(Dictionary<string, object> message)
+    {
+        // UI 비활성화 로직 구현
+        await SendResponseAsync(new { command = "UI_DISABLED", success = true });
+    }
+
+    /// <summary>
+    /// UI 강제 활성화 요청 처리
+    /// </summary>
+    private async Task HandleUIForceEnableRequestAsync(Dictionary<string, object> message)
+    {
+        // UI 강제 활성화 로직 구현
+        await SendResponseAsync(new { command = "UI_FORCE_ENABLED", success = true });
+    }
+
+    /// <summary>
+    /// 메시지 전송
+    /// </summary>
+    public async Task<bool> SendMessageAsync(string message)
+    {
+        try
+        {
+            if (_pipeServer?.IsConnected == true)
+            {
+                byte[] buffer = Encoding.UTF8.GetBytes(message);
+                await _pipeServer.WriteAsync(buffer, 0, buffer.Length, _cancellationTokenSource.Token);
+                await _pipeServer.FlushAsync(_cancellationTokenSource.Token);
+                return true;
+            }
+            
+            _logger.LogWarning("클라이언트가 연결되지 않음");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "메시지 전송 중 오류");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 응답 전송 (객체를 JSON으로 직렬화)
+    /// </summary>
+    private async Task SendResponseAsync(object response)
+    {
+        string json = JsonConvert.SerializeObject(response);
+        await SendMessageAsync(json);
+    }
+
+    /// <summary>
+    /// 매크로 실행 (예시)
+    /// </summary>
+    private async Task<bool> ExecuteMacroAsync(uint macroId)
+    {
+        // 실제 매크로 실행 로직 구현
+        // 여기서는 예시로 간단한 지연만 추가
+        await Task.Delay(100);
+        return true;
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            _cancellationTokenSource.Cancel();
+            _pipeServer?.Dispose();
+            _cancellationTokenSource.Dispose();
+            _disposed = true;
+            _logger.LogInformation("Communication 서버 종료");
+        }
+    }
+}
+
+/// <summary>
+/// 메시지 수신 이벤트 인자
+/// </summary>
+public class MessageReceivedEventArgs : EventArgs
+{
+    public string Message { get; set; } = string.Empty;
+}
+```
+
+---
+
+## 4. Windows Service 및 .NET 예제 코드
+
+### 4.1 Windows Service 구현
+
+```csharp
+/// <summary>
+/// PCRemote Windows Service 메인 클래스
+/// 
+/// .NET 6+ Generic Host를 사용한 Windows Service 구현
+/// 출처: Microsoft.Extensions.Hosting.WindowsServices 공식 문서
+/// </summary>
+public class PCRemoteWindowsService : BackgroundService
+{
+    private readonly ILogger<PCRemoteWindowsService> _logger;
+    private readonly MacroEngine _macroEngine;
+    private readonly WindowStateController _windowController;
+    private readonly CommunicationServer _communicationServer;
+
+    public PCRemoteWindowsService(
+        ILogger<PCRemoteWindowsService> logger,
+        MacroEngine macroEngine,
+        WindowStateController windowController,
+        CommunicationServer communicationServer)
+    {
+        _logger = logger;
+        _macroEngine = macroEngine;
+        _windowController = windowController;
+        _communicationServer = communicationServer;
+    }
+
+    /// <summary>
+    /// 서비스 시작
+    /// </summary>
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            _logger.LogInformation("PCRemote Windows Service 시작");
+
+            // 각 컴포넌트 초기화
+            await InitializeComponentsAsync();
+
+            // 서비스 실행 대기
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                await Task.Delay(1000, stoppingToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "서비스 실행 중 오류 발생");
+        }
+    }
+
+    private async Task InitializeComponentsAsync()
+    {
+        await _macroEngine.InitializeAsync();
+        await _communicationServer.StartAsync();
+        _logger.LogInformation("모든 컴포넌트 초기화 완료");
+    }
+}
+```
+
+### 4.2 마우스 시뮬레이션 완전 예제
+
+```csharp
+/// <summary>
+/// 마우스 입력 시뮬레이션 완전 구현
+/// 
+/// 출처: Microsoft 공식 SendInput API 문서
+/// </summary>
+public static class MouseSimulator
+{
+    // Win32 API 상수
+    private const int INPUT_MOUSE = 0;
+    private const uint MOUSEEVENTF_MOVE = 0x0001;
+    private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    private const uint MOUSEEVENTF_LEFTUP = 0x0004;
+    private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+    private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+    private const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MOUSEINPUT
+    {
+        public int dx, dy;
+        public uint mouseData, dwFlags, time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct InputUnion
+    {
+        [FieldOffset(0)] public MOUSEINPUT mi;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct INPUT
+    {
+        public int type;
+        public InputUnion u;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [DllImport("user32.dll")]
+    private static extern int GetSystemMetrics(int nIndex);
+
+    /// <summary>
+    /// 마우스 클릭
+    /// </summary>
+    public static bool Click(int x, int y, MouseButton button = MouseButton.Left)
+    {
+        int screenWidth = GetSystemMetrics(0);  // SM_CXSCREEN
+        int screenHeight = GetSystemMetrics(1); // SM_CYSCREEN
+
+        int normalizedX = (x * 65535) / screenWidth;
+        int normalizedY = (y * 65535) / screenHeight;
+
+        var inputs = new INPUT[3];
+
+        // 마우스 이동
+        inputs[0] = new INPUT
+        {
+            type = INPUT_MOUSE,
+            u = new InputUnion
+            {
+                mi = new MOUSEINPUT
+                {
+                    dx = normalizedX,
+                    dy = normalizedY,
+                    dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+                }
+            }
+        };
+
+        // 마우스 다운/업
+        uint downFlag = button == MouseButton.Left ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_RIGHTDOWN;
+        uint upFlag = button == MouseButton.Left ? MOUSEEVENTF_LEFTUP : MOUSEEVENTF_RIGHTUP;
+
+        inputs[1] = new INPUT { type = INPUT_MOUSE, u = new InputUnion { mi = new MOUSEINPUT { dwFlags = downFlag } } };
+        inputs[2] = new INPUT { type = INPUT_MOUSE, u = new InputUnion { mi = new MOUSEINPUT { dwFlags = upFlag } } };
+
+        return SendInput(3, inputs, Marshal.SizeOf<INPUT>()) == 3;
+    }
+}
+
+public enum MouseButton { Left, Right }
+```
+
+### 4.3 네트워크 통신 예제
+
+```cpp
+/**
+ * @brief WinSock을 사용한 TCP 서버 예제
+ * 
+ * 출처: Windows Classic Samples - WinSock
+ */
+class TcpServerExample {
+public:
+    HRESULT StartServer(USHORT port) {
+        // WinSock 초기화
+        WSADATA wsaData;
+        int result = ::WSAStartup(MAKEWORD(2, 2), &wsaData);
+        if (result != 0) {
+            return HRESULT_FROM_WIN32(result);
+        }
+        
+        // 소켓 생성
+        m_listenSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (m_listenSocket == INVALID_SOCKET) {
+            ::WSACleanup();
+            return HRESULT_FROM_WIN32(::WSAGetLastError());
+        }
+        
+        // 주소 바인딩
+        sockaddr_in serverAddr = {};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        serverAddr.sin_port = ::htons(port);
+        
+        if (::bind(m_listenSocket, 
+                  reinterpret_cast<sockaddr*>(&serverAddr),
+                  sizeof(serverAddr)) == SOCKET_ERROR) {
+            return HRESULT_FROM_WIN32(::WSAGetLastError());
+        }
+        
+        // 리스닝 시작
+        if (::listen(m_listenSocket, SOMAXCONN) == SOCKET_ERROR) {
+            return HRESULT_FROM_WIN32(::WSAGetLastError());
+        }
+        
+        return S_OK;
+    }
+    
+    void AcceptConnections() {
+        while (true) {
+            SOCKET clientSocket = ::accept(m_listenSocket, nullptr, nullptr);
+            if (clientSocket == INVALID_SOCKET) {
+                break;
+            }
+            
+            // 클라이언트 처리를 별도 스레드에서 수행
+            std::thread clientThread(&TcpServerExample::HandleClient, this, clientSocket);
+            clientThread.detach();
+        }
+    }
+
+private:
+    SOCKET m_listenSocket = INVALID_SOCKET;
+    
+    void HandleClient(SOCKET clientSocket) {
+        char buffer[1024];
+        int bytesReceived;
+        
+        while ((bytesReceived = ::recv(clientSocket, buffer, sizeof(buffer), 0)) > 0) {
+            // 메시지 처리
+            std::string message(buffer, bytesReceived);
+            ProcessMessage(message);
+        }
+        
+        ::closesocket(clientSocket);
+    }
+    
+    void ProcessMessage(const std::string& message) {
+        // 메시지 파싱 및 처리 로직
+    }
+};
+```
+
+---
+
+## 5. 프로젝트 구조 및 빌드
+
+### 5.1 권장 프로젝트 구조
+
+```
+PCRemoteServer/
+├── src/
+│   ├── core/
+│   │   ├── MacroEngine.cpp/.h
+│   │   ├── WindowStateController.cpp/.h
+│   │   └── HidInputMonitor.cpp/.h
+│   ├── communication/
+│   │   ├── NamedPipeServer.cpp/.h
+│   │   └── TcpServer.cpp/.h
+│   ├── utils/
+│   │   ├── Logger.cpp/.h
+│   │   └── Config.cpp/.h
+│   └── main.cpp
+├── include/
+│   └── PCRemoteServer.h
+├── resources/
+│   └── config.json
+├── CMakeLists.txt
+└── vcpkg.json
+```
+
+### 5.2 CMakeLists.txt 예제
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(PCRemoteServer)
+
+# C++ 표준 설정
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# vcpkg 통합
+find_package(wil CONFIG REQUIRED)
+
+# 실행 파일 생성
+add_executable(PCRemoteServer
+    src/main.cpp
+    src/core/MacroEngine.cpp
+    src/core/WindowStateController.cpp
+    src/core/HidInputMonitor.cpp
+    src/communication/NamedPipeServer.cpp
+    src/communication/TcpServer.cpp
+    src/utils/Logger.cpp
+    src/utils/Config.cpp
+)
+
+# 헤더 파일 경로
+target_include_directories(PCRemoteServer PRIVATE include)
+
+# 라이브러리 링크
+target_link_libraries(PCRemoteServer PRIVATE
+    WIL::WIL
+    ws2_32
+    user32
+    kernel32
+)
+
+# Windows 전용 설정
+if(WIN32)
+    target_compile_definitions(PCRemoteServer PRIVATE 
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        _WIN32_WINNT=0x0A00  # Windows 10
+    )
+endif()
+```
+
+### 5.3 vcpkg.json 설정
+
+```json
+{
+  "name": "pcremote-server",
+  "version": "1.0.0",
+  "dependencies": [
+    "wil",
+    "nlohmann-json",
+    "spdlog"
+  ],
+  "builtin-baseline": "latest"
+}
+```
+
+### 5.4 빌드 절차
+
+```cmd
+# vcpkg 초기화 (처음 한 번만)
+git clone https://github.com/Microsoft/vcpkg.git
+cd vcpkg
+.\bootstrap-vcpkg.bat
+.\vcpkg integrate install
+
+# 프로젝트 빌드
+cd PCRemoteServer
+mkdir build
+cd build
+cmake .. -DCMAKE_TOOLCHAIN_FILE=[vcpkg 경로]/scripts/buildsystems/vcpkg.cmake
+cmake --build . --config Release
+```
+
+---
+
+## 6. 테스트 및 트러블슈팅
+
+### 6.1 단위 테스트 예제
+
+```cpp
+/**
+ * @brief 매크로 엔진 단위 테스트
+ */
+class MacroEngineTest {
+public:
+    void TestBasicKeyPress() {
+        MacroEngine engine;
+        REQUIRE(SUCCEEDED(engine.Initialize()));
+        
+        // Ctrl+C 매크로 테스트
+        MacroDefinition ctrlC;
+        ctrlC.id = 1;
+        ctrlC.actions = {
+            { MacroActionType::KEY_COMBO, std::vector<WORD>{VK_CONTROL, 'C'} }
+        };
+        
+        engine.RegisterMacro(ctrlC);
+        
+        bool completed = false;
+        HRESULT result = engine.ExecuteMacro(1, [&](HRESULT hr) {
+            completed = true;
+            REQUIRE(SUCCEEDED(hr));
+        });
+        
+        REQUIRE(SUCCEEDED(result));
+        
+        // 완료 대기 (타임아웃 포함)
+        auto start = std::chrono::steady_clock::now();
+        while (!completed && 
+               std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        REQUIRE(completed);
+    }
+};
+```
+
+### 6.2 로깅 시스템
+
+```cpp
+/**
+ * @brief 로깅 시스템 구현
+ */
+class Logger {
+public:
+    enum class Level {
+        Debug,
+        Info,
+        Warning,
+        Error
+    };
+    
+    static void Log(Level level, const std::string& message) {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+        ss << " [" << LevelToString(level) << "] " << message << std::endl;
+        
+        // 콘솔 출력
+        std::cout << ss.str();
+        
+        // 파일 출력
+        if (s_logFile.is_open()) {
+            s_logFile << ss.str();
+            s_logFile.flush();
+        }
+    }
+    
+    static void Initialize(const std::string& logFileName) {
+        s_logFile.open(logFileName, std::ios::app);
+    }
+
+private:
+    static std::mutex s_mutex;
+    static std::ofstream s_logFile;
+    
+    static std::string LevelToString(Level level) {
+        switch (level) {
+            case Level::Debug: return "DEBUG";
+            case Level::Info: return "INFO";
+            case Level::Warning: return "WARN";
+            case Level::Error: return "ERROR";
+            default: return "UNKNOWN";
+        }
+    }
+};
+
+// 편의 매크로
+#define LOG_DEBUG(msg) Logger::Log(Logger::Level::Debug, msg)
+#define LOG_INFO(msg) Logger::Log(Logger::Level::Info, msg)
+#define LOG_WARN(msg) Logger::Log(Logger::Level::Warning, msg)
+#define LOG_ERROR(msg) Logger::Log(Logger::Level::Error, msg)
+```
+
+### 6.3 일반적인 문제 해결
+
+#### 6.3.1 권한 관련 문제
+
+```cpp
+/**
+ * @brief 관리자 권한 확인 및 요청
+ */
+bool IsRunningAsAdministrator() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = nullptr;
+    
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (::AllocateAndInitializeSid(
+        &ntAuthority,
+        2,
+        SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0,
+        &adminGroup)) {
+        
+        ::CheckTokenMembership(nullptr, adminGroup, &isAdmin);
+        ::FreeSid(adminGroup);
+    }
+    
+    return isAdmin != FALSE;
+}
+
+HRESULT RequestAdministratorPrivileges() {
+    if (IsRunningAsAdministrator()) {
+        return S_OK;
+    }
+    
+    // 관리자 권한으로 재시작
+    wchar_t exePath[MAX_PATH];
+    ::GetModuleFileName(nullptr, exePath, MAX_PATH);
+    
+    SHELLEXECUTEINFO sei = {};
+    sei.cbSize = sizeof(sei);
+    sei.lpVerb = L"runas";
+    sei.lpFile = exePath;
+    sei.hwnd = nullptr;
+    sei.nShow = SW_NORMAL;
+    
+    if (!::ShellExecuteEx(&sei)) {
+        return HRESULT_FROM_WIN32(::GetLastError());
+    }
+    
+    // 현재 프로세스 종료
+    ::ExitProcess(0);
+}
+```
+
+#### 6.3.2 디버깅 도구
+
+```cpp
+/**
+ * @brief 디버깅을 위한 유틸리티 함수들
+ */
+class DebugUtils {
+public:
+    /**
+     * @brief 현재 활성 창 정보 출력
+     */
+    static void PrintActiveWindowInfo() {
+        HWND hwnd = ::GetForegroundWindow();
+        if (!hwnd) return;
+        
+        wchar_t title[256] = {};
+        ::GetWindowText(hwnd, title, 256);
+        
+        wchar_t className[256] = {};
+        ::GetClassName(hwnd, className, 256);
+        
+        DWORD processId;
+        ::GetWindowThreadProcessId(hwnd, &processId);
+        
+        LOG_INFO("Active Window: Title='" + std::string(title) + 
+                "', Class='" + std::string(className) + 
+                "', PID=" + std::to_string(processId));
+    }
+    
+    /**
+     * @brief 시스템 성능 모니터링
+     */
+    static void PrintSystemPerformance() {
+        MEMORYSTATUSEX memStatus = {};
+        memStatus.dwLength = sizeof(memStatus);
+        ::GlobalMemoryStatusEx(&memStatus);
+        
+        ULONGLONG totalMemMB = memStatus.ullTotalPhys / (1024 * 1024);
+        ULONGLONG availMemMB = memStatus.ullAvailPhys / (1024 * 1024);
+        DWORD memLoad = memStatus.dwMemoryLoad;
+        
+        LOG_INFO("System Memory: " + std::to_string(memLoad) + "% used, " +
+                std::to_string(availMemMB) + "/" + std::to_string(totalMemMB) + " MB available");
+    }
+};
+```
+
+---
+
+## 7. 보안 및 권한 관리
+
+### 7.1 보안 고려사항
+
+#### 7.1.1 입력 검증
+
+```cpp
+/**
+ * @brief 안전한 입력 검증
+ */
+class InputValidator {
+public:
+    /**
+     * @brief 매크로 ID 검증
+     */
+    static bool IsValidMacroId(uint32_t macroId) {
+        // 유효한 매크로 ID 범위 확인
+        return macroId > 0 && macroId < MAX_MACRO_ID;
+    }
+    
+    /**
+     * @brief 텍스트 입력 검증
+     */
+    static bool IsValidTextInput(const std::string& text) {
+        // 최대 길이 확인
+        if (text.length() > MAX_TEXT_LENGTH) {
+            return false;
+        }
+        
+        // 금지된 문자 확인
+        for (char c : text) {
+            if (c < 32 && c != '\t' && c != '\n' && c != '\r') {
+                return false;  // 제어 문자 금지
+            }
+        }
+        
+        return true;
+    }
+    
+    /**
+     * @brief 좌표 값 검증
+     */
+    static bool IsValidCoordinate(int x, int y) {
+        int screenWidth = ::GetSystemMetrics(SM_CXSCREEN);
+        int screenHeight = ::GetSystemMetrics(SM_CYSCREEN);
+        
+        return x >= 0 && x < screenWidth && y >= 0 && y < screenHeight;
+    }
+
+private:
+    static constexpr uint32_t MAX_MACRO_ID = 10000;
+    static constexpr size_t MAX_TEXT_LENGTH = 1024;
+};
+```
+
+#### 7.1.2 액세스 제어
+
+```cpp
+/**
+ * @brief 기능별 액세스 제어
+ */
+class AccessController {
+public:
+    enum class Permission {
+        BASIC_INPUT,        // 기본 입력 (키보드/마우스)
+        MACRO_EXECUTION,    // 매크로 실행
+        WINDOW_CONTROL,     // 창 제어
+        SYSTEM_ADMIN        // 시스템 관리
+    };
+    
+    /**
+     * @brief 권한 확인
+     */
+    static bool HasPermission(Permission permission) {
+        switch (permission) {
+            case Permission::BASIC_INPUT:
+                return true;  // 모든 사용자 허용
+                
+            case Permission::MACRO_EXECUTION:
+                return IsAuthorizedUser();
+                
+            case Permission::WINDOW_CONTROL:
+                return IsAuthorizedUser();
+                
+            case Permission::SYSTEM_ADMIN:
+                return IsRunningAsAdministrator();
+                
+            default:
+                return false;
+        }
+    }
+    
+    /**
+     * @brief 작업 실행 전 권한 확인
+     */
+    template<typename Func>
+    static HRESULT ExecuteWithPermission(Permission permission, Func&& func) {
+        if (!HasPermission(permission)) {
+            LOG_WARN("Access denied for permission: " + std::to_string(static_cast<int>(permission)));
+            return E_ACCESSDENIED;
+        }
+        
+        try {
+            return func();
+        } catch (const std::exception& e) {
+            LOG_ERROR("Exception during operation: " + std::string(e.what()));
+            return E_FAIL;
+        }
+    }
+
+private:
+    static bool IsAuthorizedUser() {
+        // 구현: 설정 파일 또는 레지스트리에서 인증된 사용자 확인
+        return true;  // 임시 구현
+    }
+};
+```
+
+---
+
+## 8. 결론
+
+이 가이드는 PCRemote Windows 서버 프로그램 개발을 위한 포괄적인 구현 지침을 제공합니다. 
+
+### 8.1 핵심 포인트
+
+1. **모던 C++ 활용**: WIL을 통한 안전한 리소스 관리
+2. **Windows API 통합**: 공식 문서 기반의 검증된 패턴 사용  
+3. **확장 가능한 아키텍처**: 플러그인 방식의 매크로 시스템
+4. **안정성 우선**: 예외 처리 및 로깅을 통한 견고한 구현
+
+### 8.2 개발 진행 순서
+
+1. **기본 인프라**: 로깅, 설정, 통신 인터페이스
+2. **핵심 기능**: 매크로 엔진, 입력 시뮬레이션  
+3. **고급 기능**: 창 상태 제어, HID 모니터링
+4. **테스트 및 최적화**: 단위 테스트, 성능 튜닝
+
+### 8.3 유지보수 고려사항
+
+- **버전 관리**: 매크로 정의 및 통신 프로토콜 호환성
+- **성능 모니터링**: 입력 지연 최소화를 위한 지속적 최적화
+- **보안 업데이트**: Windows 보안 패치에 따른 코드 검토
+
+이 가이드를 기반으로 안정적이고 확장 가능한 PCRemote Windows 서버를 구현할 수 있습니다.

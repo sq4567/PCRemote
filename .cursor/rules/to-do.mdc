@@ -1,0 +1,184 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+## PCRemote To-Do
+
+**체크율**: 85 / 155 (54.8%)
+
+### 설계 관련(문서별)
+- [x] `@touchpad.md`, `@styleframe-BIOS.md`용 간이 터치패드 관련 섹션(구조, 상호작용 명세, 유저 플로우 등) 추가 작성
+- [x] `@Docs/의 모든 문서`
+  - [x] 링크 처리되지 않은 목차 작성
+  - [x] `graphics-shapes`가 반드시 필요한 부분 찾기 (만약 `graphics-shapes`가 현재 쓰이는 곳을 모두 VectorDrawerble로 대체 가능하다면, 모든 문서에서 `graphics-shapes` 관련 언급 삭제)
+  - [x] 문서 내용 중 개발 코드 예제 삭제(특정 API를 활용하라는 문구와 같이 코드 구현에 도움이 되는 내용은 삭제하지 않고 유지)
+  - [x] 문서 간 상충/모순 점검
+    - [x] 용어/정의 정합성 검토(모드/옵션/상태 명칭)
+    - [x] 수치/상수 충돌 점검(DPI/임계/애니메이션 시간)
+    - [x] 플로우/전환 규칙 불일치 검출(PRD §10.x ↔ Touchpad §3.x)
+    - [x] 해결안 정리 및 원문 수정 제안 초안 작성
+  - [ ] LLM이 읽기 좋은 문서 구조로 개선(내용 변경 금지)
+    - [x] Front matter 메타데이터 추가(title, description, tags, version, owner, updated, status)
+    - [x] 용어집/정의 섹션 생성(동의어/금칙어 포함; '활성/비활성'은 Selected/Unselected, Enabled/Disabled로 매핑)
+    - [x] 상수/임계값 표 표준화(단위/기본값/범위/출처)
+  - [ ] `@drawable/`에 위치한 XML 파일들을 각 문서의 이미지 활용 부분으로 대체
+  - [x] `@Docs/의 모든 문서`에 하이브리드 유선 통신 아키텍처(단방향 HID + 양방향 Vendor/CDC) 명시
+  - [x] 해당 문서 내용이 하드웨어 전체에서 어디쯤 해당하며, 무엇으로부터 어떤 신호를 주고받는지 파악할 수 있도록 @## 2. 시스템 아키텍처의 하드웨어 연결 구조를 필요한 문서에 삽입하기
+  - [x] 시스템 아키텍처의 하드웨어 연결 구조와 관련해 문서 내용에 기술적, 물리적으로 수정이 필요한 점 찾아 해결하기
+- [ ] `Docs/PRD.md`
+  - [x] 연결 전략 상위 원칙 확정: 유선(USB‑OTG) 우선, BLE(HOGP) 백업(§4.1~§4.2)
+  - [x] 핵심 요구사항에 HID 연결 방식 명시(§1)
+  - [x] 사용자 제약/시야 분포 기반 UX 요구사항을 설계 가이드에 매핑(§2.1)
+  - [x] 페이지 구성(마우스/키보드/작업별) IA 상위 정의(§3.2)
+  - [x] §3.2 페이지별 기능 구성에 스타일프레임 링크 추가: `Docs/styleframe-BIOS.md`, `Docs/styleframe-page3.md`
+  - [x] 개발 계획 디테일하게 재작성(§5)
+  - [x] 이 프로젝트를 통해 해결하려는 문제 작성
+  - [x] 문서 개편: 1장 구조를 문제 상황/해결책/프로젝트 소개/킬링 포인트/핵심 기능으로 재배치(§1)
+- [x] `Docs/implementation-guide.md`
+  - [x] `@usb-hid-bridge-architecture.md`, `@design-guide-app.md`, `@component-design-guide.md`, `@touchpad.md`의 모든 컴포넌트가 잘 동작하도록 필요한 코드 구현 가이드를 체계적으로 정리
+- [ ] `@README.md`
+  - [ ] 코드베이스의 모든 내용에 부합하도록 전면 재작성
+- [x] `Docs/windows-server-guide.md`
+  - [x] `@PRD.md`, `@design-guide-app.md`, `@component-design-guide.md`, `@touchpad.md`를 종합적으로 활용해서 초안 작성(예제 코드는 포함 X)
+- [ ] `Docs/design-guide-app.md`
+  - [x] DPad 예외 규칙(동일 포인터 유지 시 드래그로 방향 전환 허용) 추가 및 문서 반영(§1.2.1)
+  - [x] `ComposeCustomShapesTheme` 할루시네이션(존재하지 않는 API) 관련 서술을 Jetpack Compose 공식 문서 기반의 정확한 내용으로 수정(§9.2~§9.3)
+  - [x] §5.2 상태 알림 토스트 실제 구현 가이드 보강 — 공식 Compose 문서 참조 및 내용 구체화(§5.2.5 추가, AnimatedVisibility/Easing/Semantics LiveRegion/LaunchedEffect 반영)
+  - [x] §5.3 페이지 인디케이터 구현 가이드 추가 — 공식 Compose 문서(API: animate*AsState/Animatable/tween/spring, Foundation Pager 연동) 기반의 상세 구현 지침(§5.3.4)
+  - [x] §5.4 햅틱 피드백: 라이트/미디엄/스트롱/에러/연속 카테고리 정의 및 Android API 매핑(VibratorManager/Vibrator, VibrationEffect Predefined/OneShot/Waveform, Compose LocalHapticFeedback) 반영(§5.4.2~§5.4.4)
+  - [x] 장기 작업 입력 차단 오버레이 정책(§10.4) 관련
+    - [x] 장기 작업 입력 차단 오버레이 정책(§10.4) 개선 — `Docs/design-guide-app.md` §10.4.5~§10.4.9 반영
+    - [x] 위 방식과 달리 특정 페이지 혹은 컴포넌트를 각각 비활성화하고 터치 입력을 차단할 수 있도록 설계하는 것이 앱 설계, 코드 복잡도, 실행 속도 측면에서 얼마나 큰 손해가 되는지 상세히 분석하기 — §10.4.8에 분석 추가, 예외 케이스 §10.4.6 명시
+      - 현재 설계는 '장기 작업 시작' 신호 시 페이지 전체 오버레이(터치 입력 차단 + 흑백 필터)를 적용하므로 별도 '비활성 색상'을 정의하지 않음. 다만 아래 케이스에서는 회색 비활성 표현이 더 자연스러울 수 있음
+      - `Docs/touchpad.md` §3.2.4 커서 모드 플로우(CursorModeButton) 전환 시: 화면 전체가 회색이면 부자연스러울 수 있음
+      - `Docs/design-guide-app.md` §10.3.1 페이지 전환 방식: 페이지 인디케이터의 비활성 닷은 회색이 자연스러움
+    - [x] 전체 오버레이 방식을 국소 비활성 방식(특정 페이지 혹은 컴포넌트를 각각 비활성화하고 터치 입력을 차단할 수 있도록 설계)으로 전환
+    - [x] 페이지 및 컴포넌트의 입력 차단 상태를 `Disabled`, 페이지 및 컴포넌트의 비선택 상태를 `Unselected`로 새로 정의함.
+  - [x] 기존 연결/네비/오류/복구/종료 플로우(§10.1~§10.6)를 `Android - 동글 - Windows 간접 연결 구성`에 맞게 전면 재구성하기
+  - [x] BIOS/Boot-safe 전용 페이지 별도 문서(`styleframe-BIOS.md`) 작성 및 §10.7 내용 이관
+  - [x] 문서 전체: 남용된 백틱 제거
+  - [x] §8.1 제스처 정의: 길게 누르기 동작을 '페이지 전환 슬라이드 제스처' 터치 영역 내 롱프레스에서만 동작하도록 문서에 구체화
+  - [x] 각 컴포넌트들의 디자인 요소로 아이콘을 사용하는 경우가 많은데, 이때 @drawable/에 위치한 svg 파일을 사용하는 것과 graphics-shapes를 활용하는 것 중 이 프로젝트에서 더 적합한 방식이 뭔지 심층 분석 후 그 결과대로 문서에 적용하기
+  - [x] 공통 및 특수 컴포넌트가 배치될 각 페이지별 스타일프레임 문서 연결용 섹션 생성 및 연결(§11)
+  - [x] §10.4.2 모든 터치 가능한 컴포넌트 비활성화: 강제 해제(트리거 소스 재클릭) 규칙 및 MacroButton 예시 추가
+- [ ] `Docs/component-design-guide.md`
+  - [x] 컴포넌트 각각의 Disabled 상태 문서에 정의하기(`design-guide-app.md` §10.4 준수)
+  - [x] 버튼에 매핑할 주요 기능 및 유저 플로우, 구현 가이드 작성(§2.1)
+  - [x] 버튼 컴포넌트 §2에 `2.4 구현 가이드(Compose, 공식 문서 준수)` 추가 — `Docs/design-guide-app.md` §5.2.5 형식 준수
+  - [x] §2.3 유저 플로우 개선: 버튼 그리드 사용 제거, 버튼 페이지별 자유 배치(빌드 후 유저 수정 불가), 리플 효과 삭제, MacroButton 진행 표시 제거 → 작업 시작/종료만 상태 알림 토스트로 표시(`Docs/design-guide-app.md` §5.2)
+  - [x] §2 버튼 컴포넌트: 각 기능별 버튼(KeyboardKeyButton/ShortcutButton/MacroButton) 하위 섹션 분리 및 재작성(§2.2.1~§2.2.3). 리플 제거 정책 반영 및 MacroButton 진행 표시 제거 정책 정합화
+  - [x] 4방향 D패드 컴포넌트 구체화
+  - [x] `PRD.md`, `design-guide-app.md`를 전반적으로 읽고 유저가 유용하게 쓸 수 있을만한 새로운 컴포넌트 아이디어 기획 및 추가 작성
+  - [x] 새 컴포넌트: 녹화 매크로(녹화 시작 후 PC에서 진행한 작업을 원할 때 반복) 초안 작성
+  - [x] 문서 전체 내용 훼손을 주의하며 유저 플로우 등 내가 읽기 조금 쉽게 재구성하기
+  - [x] §4 녹화 매크로 컴포넌트 — 각 버튼의 이미지 지침(svg vs. custom shape) 구체화(§4.11 추가)
+  - [x] 각 버튼에 어떤 키보드 키, 단축키 조합을 코드 단에서 쉽게 고를 수 있도록 array 구축 준비 문서 추가(코드 작성 X)
+  - [ ] §2.2(버튼 시퀀스/디바운스)·§2.4(Disabled/강제 해제) 정책을 중앙 스펙 "플랫폼 계약·UI 정책" 섹션에 상호 링크
+- [x] `Docs/touchpad.md`
+  - [x] 상위 가이드라인인 `Docs/design-guide-app.md`과 충돌하는 내용이 있는지 찾고, 존재한다면 개선
+  - [x] Disabled 상태 문서에 정의하기(`design-guide-app.md` §10.4 준수)
+  - [x] "상세 알고리즘은 `Docs/technical-specification.md`에 작성 예정" 문구를 본문 앵커 링크로 교체(제스처/모드/옵션 알고리즘 섹션)
+  - [ ] 테두리 색상/우선순위/스크롤 가이드라인 상수표를 중앙 스펙 상수표에 링크(중복 제거)
+- [ ] `Docs/usb-hid-bridge-architecture.md`
+  - [x] 실행 가능하도록 만드는 필수 세부(상태/오류/복구/성능/예제/준수 항목) v2 보강
+  - [x] §6 "ESP32‑S3 구현 가이드(ESP‑IDF/TinyUSB)"로 재작성(공식 API 나열, 설계-구현 매핑, 상태/이벤트 처리 표준)
+  - [x] 엔드투엔드 경로/신뢰성 가정 명세(USB 우선)
+  - [x] HID Report Descriptor(부트) 참조 추가 및 Boot↔Report 전환 정책
+  - [x] 입력 매핑/분할 주입 규칙(i16→−127..127 분할)
+  - [x] OS/BIOS 단계 호환성 주요 요구 사항 문서화(요약)
+  - [x] Keep‑alive, 오류 감지, 재연결(백오프) 정책 명시(앱/동글 역할 분리)
+  - [x] Geekble nano ESP32‑S3 보드별 레퍼런스 구현(§6.5~§6.12) 추가: 핀맵/초기화/프레이밍/분할주입/SET_PROTOCOL/빌드·플래시/성능 파라미터
+  - [ ] §3 프로토콜 표/§5.1.1 Boot↔Report 전환 정책에 `Docs/technical-specification.md` 해당 섹션 앵커 링크 추가(명세의 단일 출처화)
+- [ ] `Docs/technical-specification.md`
+  - [x] 처음부터 재작성: v0 스켈레톤 확정(섹션/책임 분리/지표/테스트)
+  - [ ] 제스처/모드/옵션 알고리즘 상세, Report 포맷 표, 상태 전이 다이어그램 추가
+  - [ ] Boot-safe/네비/복구 시나리오를 시스템 상태 관점으로 통합
+  - [x] 중앙 교차 계약(Single Source of Truth) 선언 및 범위 확정: 프로토콜/상태/알고리즘/성능/오류를 본 문서로 일원화
+  - [x] 섹션 구성 확정 및 자리표시자 추가: 목적·범위·용어 → 시스템 개요 → 프로토콜(8B 프레임/flags/분할주입/keep‑alive) → 상태모델(BootSafe↔Normal, Mermaid) → 제스처/모드/옵션 알고리즘 → 성능 KPI/측정법 → 오류/폴백 → 플랫폼 계약(Android/ESP32‑S3/Windows) → 변경관리/추적성
+  - [ ] 교차 링크 정비: `Docs/touchpad.md` §1/§3 알고리즘 참조를 본 문서 해당 섹션 앵커로 연결, `Docs/usb-hid-bridge-architecture.md` §3/§5.1.1 참조를 본 문서 프로토콜/전환 섹션으로 연결, `Docs/component-design-guide.md` §2.2/§2.4(Disabled/매크로) 관련 규범을 본 문서 계약 섹션으로 연결
+  - [x] 상태 전이 다이어그램(Mermaid) 초안 추가: BootSafe ↔ Normal, 연결/끊김/핸드셰이크 이벤트 포함
+  - [x] RFC2119 규범 문구 일괄 적용(MUST/SHOULD/MAY) 및 용어집/상수표와 교차 참조
+- [ ] `Docs/styleframe-page1.md`
+  - [x] 문서 초안 작성
+- [ ] `Docs/styleframe-page2.md`
+  - [x] 문서 초안 작성
+- [ ] `Docs/styleframe-page3.md`
+  - [x] 문서 초안 작성
+- [ ] `Docs/styleframe-BIOS.md`
+  - [x] 문서 초안 작성
+- [x] `모든 styleframe 문서`
+  - [x] 화면 구성이 눈에 보이게 대략적으로라도 아스키 코드로 작성하기
+- [ ] `backend-server.md`
+  - [ ] 초안 작성
+  - [ ] C++ 기반으로의 전환을 위한 관련 프로젝트 조사하기
+- [ ] `design-guide-server.md`
+  - [ ] 초안 작성
+- [ ] `styleframe-server.md`
+  - [ ] 초안 작성
+- [x] `Docs/adr/0001-doc-architecture-hybrid.md`
+  - [x] ADR 작성: Context(문서 난립/교차 계약 필요) · Decision(하이브리드 구조 채택) · Consequences(중앙 스펙 우선, 플랫폼 문서는 구현 세부로 분리)
+- [ ] `user-flow-guide.md`
+  - [x] 프로젝트의 모든 코드베이스를 읽고, 안드로이드에서 보드, 보드에서 PC로, 혹은 그 반대 방향으로 이어지는 전반적인 유저 플로우를 기록한 문서 초안 작성
+
+
+### 개발 관련
+- [ ] @Docs/의 모든 문서를 참조한 후 실제 코드로 구현하기 위한 Rule들을 `.mdc` 형식으로 @rules/에 생성하기
+  - [x] ESP32‑S3 코드 구현 가이드(+ 공식 문서 예제 코드) 문서 작성
+  - [x] 특수 컴포넌트를 제외한 Android 앱 뼈대 구현 가이드(+ 공식 문서 예제 코드) 작성
+  - [x] Windows 서버 프로그램 가이드(+ 공식 문서 예제 코드) 문서 작성
+  - [ ] Windows 서버 프로그램 멀티 커서 구현 문서 작성
+  - [ ] Windows 서버 프로그램 녹화 매크로 구현 문서 작성
+  - [ ] 특수 컴포넌트: `@touchpad.md` 기반 터치패드 컴포넌트 구현 가이드
+  - [ ] 특수 컴포넌트: `@component-design-guide.md` 기반 버튼 컴포넌트 구현 가이드
+  - [ ] 특수 컴포넌트: `@component-design-guide.md` 기반 4방향 D패드 컴포넌트 구현 가이드
+  - [ ] 특수 컴포넌트: `@component-design-guide.md` 기반 녹화 매크로 컴포넌트 구현 가이드
+  - [ ] 페이지: `@styleframe-BIOS.md` 기반 page-BIOS 구현 가이드
+  - [ ] 페이지: `@styleframe-page1.md` 기반 page1 구현 가이드
+  - [ ] 페이지: `@styleframe-page2.md` 기반 page2 구현 가이드
+  - [ ] 페이지: `@styleframe-page3.md` 기반 page3 구현 가이드
+- [ ] `@drawable/`에 있는 SVG 파일 VectorDrawable(XML) 파일로 변환
+- [ ] 프로젝트 인프라/구조 정비
+  - [ ] 모듈 구조: `feature/*`, `core/*` 분리 및 패키지 이동
+  - [ ] Compose Material3 다크 테마/폰트 적용, 디자인 토큰 반영
+  - [ ] 네비게이션 스캐폴드 + 제스처 컨테이너 구축
+- [ ] 공통 UI 컴포넌트 구현
+  - [ ] 상태 알림 토스트(상태별 스타일/애니메이션/표시 시간)
+  - [ ] 페이지 인디케이터(활성/비활성, 스케일 스프링)
+  - [ ] 햅틱 API(가벼움/중간/강함/오류/연속)
+  - [ ] 입력 차단 오버레이(흑백 필터, 페이드 인/아웃)
+- [ ] 터치패드 구현(feature/touchpad)
+  - [ ] TouchpadWrapper(1:2 비율/최소 크기/마스크)
+  - [ ] TouchpadAreaWrapper + pad1/pad2 분할/통합(애니메이션)
+  - [ ] ControlButtonContainer(상단 15%, 크기/간격/여백 비율)
+  - [ ] 제스처/입력 엔진(데드존/보상/더블탭/롱프레스)
+  - [ ] 모드 버튼: Click/Move/Scroll/Cursor(표시/숨김/상태 보존 규칙)
+  - [ ] 옵션 버튼: DPI/스크롤 감도
+  - [ ] 스크롤 가이드라인(일반/무한, 숨김 지연)
+  - [ ] 테두리 색상 규칙(우선순위/그라데이션/멀티 커서 활성만 표시)
+  - [ ] 애니메이션/햅틱 일괄 적용
+- [ ] 연결(feature/connection)
+  - [ ] USB‑OTG HID: 권한/탐지/연결/전송/해제, Boot/Report Protocol 전환
+  - [ ] Keep‑alive(5s), 오류/분리 감지, 재연결 백오프
+  - [ ] 서버 핸드셰이크/동글 Notify 수신 처리
+  - [ ] BLE(HOGP) 스켈레톤: 스캔/페어/연결 인터페이스(2차 데이터 경로는 연구 결과 반영)
+- [ ] 상태/네비게이션(feature/navigation, feature/boot_safe)
+  - [ ] 상태 머신(BootSafe ↔ Normal), 페이지 전환 제스처/토스트/햅틱
+  - [ ] Boot-safe 페이지(허용 기능 최소: 이동/좌클릭/드래그, 배너)
+- [ ] 백그라운드/저장(core/state)
+  - [ ] Foreground Service로 연결 유지/알림
+  - [ ] SharedPreferences 즉시 저장(페이지/모드/DPI/입력 진행 상태)
+  - [ ] 비정상 종료 복구(안전 모드/세션 동기화)
+- [ ] 오류/예외 처리(core/util)
+  - [ ] 연결 오류 UI(테두리 점멸/버튼 그레이아웃/토스트)
+  - [ ] 타임아웃/권한 오류/재시도/설정 이동
+- [ ] 테스트/QA
+  - [ ] 알고리즘 단위 테스트(데드존/축 스냅/스크롤 단위·감쇠)
+  - [ ] Compose UI 테스트(버튼 표시/숨김/애니메이션/인디케이터)
+  - [ ] 통합 테스트(연결/끊김/재연결/Boot-safe 전환)
+  - [ ] 성능 테스트(60fps, 입력 지연 < 50ms)
+- [ ] 빌드/배포/CI
+  - [ ] 의존성 버전 고정(`gradle/libs.versions.toml`)
+  - [ ] 릴리즈 서명/Proguard 예외(입력 경로 보존)
+  - [ ] 간단 CI(빌드/테스트) 및 크래시 로깅 검토
+

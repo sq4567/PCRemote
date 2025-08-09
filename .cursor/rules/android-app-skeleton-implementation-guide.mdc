@@ -1,0 +1,1049 @@
+## Android 앱 뼈대 구현 가이드 — Jetpack Compose (공식 문서/샘플 기반)
+
+---
+title: Android 앱 뼈대 구현 가이드
+description: 특수 컴포넌트를 제외한 앱 기본 구조(Theme, Navigation, Scaffold, State, Haptic, Snackbar/Toast, Pager, Foreground Service, 권한/USB Host 스켈레톤)를 Jetpack Compose와 공식 예제를 바탕으로 구현하기 위한 규칙서
+tags: [android, jetpack-compose, material3, navigation, state, haptic, snackbar, pager, foreground-service, usb-host]
+version: v0.1.0
+owner: PCRemote 팀
+updated: 2025-08-13
+status: draft
+---
+
+### 0. 전제/원칙
+- UI 문서의 ‘활성/비활성’ 표기는 Selected/Unselected(선택 상태), Enabled/Disabled(입력 가능)로 일관 매핑한다 [[memory:5809234]].
+- 단일 Activity + Jetpack Compose 아키텍처를 기본으로 한다.
+- 상태는 ViewModel + StateFlow를 사용하고, Compose에서는 collectAsStateWithLifecycle로 구독한다.
+- 기본 디자인은 Material 3. 다크/라이트, 다이내믹 컬러(Android 12+) 지원.
+- 본 문서는 “뼈대”에 한정하며, 터치패드/특수 버튼 등 특수 컴포넌트 구현은 제외한다.
+
+### 1. 패키지/모듈 구조(권장)
+- 단일 모듈 기준 패키지 가이드:
+  - `core/ui/theme/` — 컬러/타이포/테마
+  - `core/ui/design/` — 공용 컨테이너/UX 정책(Disabled 처리 등)
+  - `feature/home/` — 홈/허브 화면
+  - `feature/settings/` — 설정 화면
+  - `app/` — `PCRemoteApp`, 네비게이션 그래프, Scaffold
+
+추후 멀티 모듈 분리는 `core/*`, `feature/*`로 확장한다.
+
+### 2. 의존성(참고)
+- Navigation: `androidx.navigation:navigation-compose`
+- Lifecycle Compose: `androidx.lifecycle:lifecycle-runtime-compose`
+- Foundation Pager: `androidx.compose.foundation:foundation`
+- Material3: `androidx.compose.material3:material3`(BOM 사용 권장)
+- Hilt: `com.google.dagger:hilt-android` (DI 프레임워크)
+- Coroutines: `org.jetbrains.kotlinx:kotlinx-coroutines-android`
+
+공식 가이드: Navigation Compose, Material3, Foundation Pager.
+
+### 3. Theme(Material3 + Dynamic Color)
+```kotlin
+/**
+ * PCRemote Material3 테마. 다이내믹 컬러(Android 12+)와 다크/라이트 테마를 지원한다.
+ */
+@Composable
+fun PCRemoteTheme(
+  darkTheme: Boolean = isSystemInDarkTheme(),
+  dynamicColor: Boolean = true,
+  content: @Composable () -> Unit
+) {
+  val context = LocalContext.current
+  val colorScheme = when {
+    dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+      if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+    }
+    else -> if (darkTheme) DarkColorScheme else LightColorScheme
+  }
+  MaterialTheme(
+    colorScheme = colorScheme,
+    typography = AppTypography,
+    content = content
+  )
+}
+```
+참고: Material3 테마와 다이내믹 컬러는 Jetpack Compose 공식 샘플(Reply, JetNews) 구조를 따른다.
+
+### 4. App Scaffold + Navigation
+```kotlin
+/**
+ * 앱 최상위 컴포저블: Scaffold + NavHost를 구성한다.
+ */
+@Composable
+fun PCRemoteApp() {
+  val navController = rememberNavController()
+  val snackbarHostState = remember { SnackbarHostState() }
+  PCRemoteTheme {
+    Scaffold(
+      topBar = { TopAppBar(title = { Text("PCRemote") }) },
+      snackbarHost = { SnackbarHost(hostState = snackbarHostState) }
+    ) { innerPadding ->
+      NavHost(
+        navController = navController,
+        startDestination = "home",
+        modifier = Modifier.padding(innerPadding)
+      ) {
+        composable("home") { HomeRoute(onNavigateSettings = { navController.navigate("settings") }) }
+        composable("settings") { SettingsRoute(onBack = { navController.popBackStack() }) }
+      }
+    }
+  }
+}
+```
+참고: Jetnews/Now in Android의 App + NavGraph 분리 패턴 참고.
+
+### 5. ViewModel + StateFlow + collectAsStateWithLifecycle
+```kotlin
+data class HomeUiState(
+  val isEnabled: Boolean = true,
+  val message: String = ""
+)
+
+/**
+ * Home 화면 상태를 보유하는 ViewModel. StateFlow로 전체 UI 상태를 노출한다.
+ */
+class HomeViewModel : ViewModel() {
+  private val _state = MutableStateFlow(HomeUiState())
+  val state: StateFlow<HomeUiState> = _state.asStateFlow()
+
+  fun toggleEnabled() { _state.update { it.copy(isEnabled = !it.isEnabled) } }
+}
+
+/**
+ * Route 레벨: ViewModel을 획득해 상태를 구독하고, 화면에 전달한다.
+ */
+@Composable
+fun HomeRoute(
+  onNavigateSettings: () -> Unit,
+  viewModel: HomeViewModel = viewModel()
+) {
+  val uiState by viewModel.state.collectAsStateWithLifecycle()
+  HomeScreen(
+    isEnabled = uiState.isEnabled,
+    onToggle = { viewModel.toggleEnabled() },
+    onNavigateSettings = onNavigateSettings
+  )
+}
+```
+공식 패턴: `collectAsStateWithLifecycle()`.
+
+### 6. State Hoisting(상태 끌어올리기)
+```kotlin
+/**
+ * 상태를 외부로 끌어올려 재사용성과 테스트 용이성을 높인다.
+ */
+@Composable
+fun ToggleButton(
+  isSelected: Boolean,
+  onToggle: (Boolean) -> Unit,
+  modifier: Modifier = Modifier
+) {
+  FilledTonalButton(onClick = { onToggle(!isSelected) }, modifier = modifier) {
+    Text(if (isSelected) "Selected" else "Unselected")
+  }
+}
+```
+
+### 7. Snackbar/Toast
+```kotlin
+/**
+ * 스낵바 표시 예제. 코루틴으로 표시 수명 제어.
+ */
+@Composable
+fun SnackbarSample(snackbarHostState: SnackbarHostState) {
+  val scope = rememberCoroutineScope()
+  Button(onClick = {
+    scope.launch { snackbarHostState.showSnackbar(message = "작업 완료", withDismissAction = true) }
+  }) { Text("Show Snackbar") }
+}
+
+/**
+ * 토스트 예제(단순 알림). 접근성 대응이 필요한 경우 스낵바를 우선 고려.
+ */
+@Composable
+fun ToastSample() {
+  val context = LocalContext.current
+  Button(onClick = { Toast.makeText(context, "안내", Toast.LENGTH_SHORT).show() }) { Text("Show Toast") }
+}
+```
+공식: `SnackbarHost`/`SnackbarHostState` 사용.
+
+### 8. Haptic(진동 피드백)
+```kotlin
+/**
+ * OS 사전 정의 햅틱 효과 사용(LongPress 등).
+ */
+@Composable
+fun HapticSample() {
+  val haptic = LocalHapticFeedback.current
+  Button(onClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress) }) {
+    Text("Haptic")
+  }
+}
+```
+권장: 라이트/미디엄/스트롱 카테고리는 기기별 차이가 있으므로 OS 프리셋 우선.
+
+### 9. Pager(Foundation)
+```kotlin
+/**
+ * 페이지 인디케이터와 연동 가능한 기본 Pager.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun PagerSample() {
+  val pagerState = rememberPagerState(initialPage = 0, pageCount = { 3 })
+  Column {
+    HorizontalPager(state = pagerState) { page ->
+      Box(Modifier.fillMaxWidth().height(160.dp), contentAlignment = Alignment.Center) {
+        Text(text = "Page $page")
+      }
+    }
+    // 페이지 인디케이터는 별도 구현 가이드를 따름
+  }
+}
+```
+공식: `androidx.compose.foundation.pager.*`.
+
+### 10. Foreground Service(연결 유지 등 백그라운드 처리의 뼈대)
+```kotlin
+/**
+ * 포그라운드 서비스: 최소 알림 채널/알림과 함께 시작한다.
+ */
+class ConnectionService : Service() {
+  override fun onCreate() {
+    super.onCreate()
+    val channelId = "pcremote_conn"
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      val channel = NotificationChannel(channelId, "PCRemote Connection", NotificationManager.IMPORTANCE_LOW)
+      (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+    }
+    val notification = NotificationCompat.Builder(this, channelId)
+      .setSmallIcon(R.drawable.ic_launcher_foreground)
+      .setContentTitle("PCRemote")
+      .setContentText("연결 유지 중")
+      .build()
+    startForeground(1, notification)
+  }
+  override fun onBind(intent: Intent?): IBinder? = null
+}
+
+/**
+ * 서비스 시작 헬퍼.
+ */
+fun Context.startConnectionService() {
+  val intent = Intent(this, ConnectionService::class.java)
+  ContextCompat.startForegroundService(this, intent)
+}
+```
+공식: Foreground Service + Notification Channel.
+
+### 11. 권한/USB Host 스켈레톤(구조만)
+```kotlin
+/**
+ * 런타임 권한 요청(예: 알림 권한 Android 13+). USB 권한은 별도 PendingIntent로 처리.
+ */
+@Composable
+fun PermissionSample() {
+  val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+    // granted 처리
+  }
+  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+    Button(onClick = { launcher.launch(Manifest.permission.POST_NOTIFICATIONS) }) { Text("권한 요청") }
+  }
+}
+
+/**
+ * USB Host API의 최소 탐색/권한 요청 스켈레톤.
+ */
+fun Context.enumerateUsbDevices() {
+  val usb = getSystemService(Context.USB_SERVICE) as UsbManager
+  val devices = usb.deviceList.values
+  // 권한 요청은 ACTION_USB_DEVICE_ATTACHED 브로드캐스트/특정 PendingIntent 사용
+}
+```
+공식: Android USB Host API 문서 참고. 실제 전송/권한 플로우는 연결 모듈 가이드에서 구체화한다.
+
+### 12. 접근성(Accessibility)
+- 모든 터치 가능 요소에 적절한 `contentDescription`을 지정한다.
+- 중요 상태 변화는 Snackbar 등으로 안내(시각적/스크린리더 동시 고려). 필요 시 Semantics의 LiveRegion 사용.
+- 포커스 이동, 탭 순서, 명확한 대비를 유지한다.
+
+### 13. 테스트(요)
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class HomeScreenTest {
+  @get:Rule val composeTestRule = createAndroidComposeRule<MainActivity>()
+  @Test fun toggleButton_togglesState() {
+    composeTestRule.onNodeWithText("Unselected").performClick()
+    composeTestRule.onNodeWithText("Selected").assertExists()
+  }
+}
+```
+공식: Compose UI 테스트 가이드.
+
+### 14. 서버 연결 및 통신 (Transport + Server Discovery)
+
+**중요**: 본 섹션은 두 가지 통신 경로를 다룹니다:
+
+1. **기본 경로 (HID)**: Android → CP2102 → ESP32-S3 → PC (마우스 제어)
+   - 단방향 통신으로 8바이트 마우스 프레임 전송
+   - BIOS/OS 관계없이 항상 동작
+
+2. **확장 경로 (Vendor/CDC)**: Android ↔ CP2102 ↔ ESP32-S3 ↔ PC Windows 서버
+   - **USB 기반 양방향 통신**
+   - ESP32-S3의 복합 장치 기능 활용
+   - Windows 서버가 Vendor/CDC 인터페이스로 직접 통신
+   - 고급 기능 (멀티 커서, 매크로 등) 지원
+
+서버가 없어도 기본 마우스 기능은 정상 작동하며, 서버 설치 시 USB를 통해 자동으로 연결됩니다.
+
+**ESP32-S3 복합 장치 구성**:
+ESP32-S3는 TinyUSB를 사용하여 다음과 같은 복합 장치로 동작합니다 ([참조: ESP-IDF Issue #15650](https://github.com/espressif/esp-idf/issues/15650)):
+- **HID 인터페이스**: 표준 마우스 기능 (Boot/Report 프로토콜 지원)
+- **CDC-ACM 인터페이스**: Windows 서버와의 양방향 시리얼 통신
+
+Windows PC에서는 두 개의 별도 장치로 인식됩니다:
+- "HID-compliant mouse" (장치 관리자 > 휴먼 인터페이스 장치)
+- "USB Serial Device (COMx)" (장치 관리자 > 포트)
+
+#### 14.1 Transport Manager (USB/BLE 연결 관리)
+```kotlin
+/**
+ * USB 및 BLE 트랜스포트 상태를 관리하는 싱글톤.
+ * USB-OTG를 우선 시도하고, 실패 시 BLE로 폴백한다.
+ */
+sealed class TransportState {
+    object NoTransport : TransportState()
+    object UsbOpening : TransportState()
+    object UsbReady : TransportState()
+    object BleOpening : TransportState()
+    object BleReady : TransportState()
+}
+
+/**
+ * 공통 상수 정의 (technical-specification.md 참조)
+ */
+object TransportConstants {
+    // CP2102 USB-Serial 어댑터 식별자 (usb-hid-bridge-architecture.md §1 참조)
+    const val CP2102_VID = 0x10C4  // Silicon Labs VID
+    const val CP2102_PID = 0xEA60  // CP2102 PID
+    
+    // UART 설정 (usb-hid-bridge-architecture.md §4.2 참조)
+    const val UART_BAUD_RATE = 1_000_000  // 1 Mbps
+    const val UART_TIMEOUT_MS = 100  // UART 읽기 타임아웃
+    
+    // 타이밍 상수 (technical-specification.md §2 참조)
+    const val KEEP_ALIVE_INTERVAL_MS = 5000L  // 5초
+    const val KEEP_ALIVE_MISSED_THRESHOLD = 3
+    const val CONNECTION_TIMEOUT_MS = 5000L
+    const val DISCOVERY_TIMEOUT_MS = 2000L
+    const val TX_PERIOD_MS = 8L  // 4-8ms 범위 중 상한값
+    
+    // 프레임 관련
+    const val FRAME_SIZE_BYTES = 8
+    const val BULK_TRANSFER_TIMEOUT_MS = 4  // 2-4ms 권장
+}
+
+class TransportManager @Inject constructor(
+    private val usbManager: UsbManager,
+    private val context: Context
+) {
+    private val _transportState = MutableStateFlow<TransportState>(TransportState.NoTransport)
+    val transportState: StateFlow<TransportState> = _transportState.asStateFlow()
+    
+    suspend fun startDiscovery() {
+        _transportState.value = TransportState.UsbOpening
+        
+        // USB-OTG 우선 시도
+        val usbDevice = findUsbDevice()
+        if (usbDevice != null && requestUsbPermission(usbDevice)) {
+            connectUsb(usbDevice)
+            _transportState.value = TransportState.UsbReady
+        } else {
+            // USB 실패 시 BLE 폴백
+            _transportState.value = TransportState.BleOpening
+            if (connectBle()) {
+                _transportState.value = TransportState.BleReady
+            } else {
+                _transportState.value = TransportState.NoTransport
+            }
+        }
+    }
+    
+    private fun findUsbDevice(): UsbDevice? {
+        // VID/PID로 CP2102 USB-Serial 어댑터 탐색
+        return usbManager.deviceList.values.find { device ->
+            device.vendorId == TransportConstants.CP2102_VID && 
+            device.productId == TransportConstants.CP2102_PID
+        }
+    }
+    
+    private suspend fun requestUsbPermission(device: UsbDevice): Boolean {
+        // USB 권한 요청 (PendingIntent 사용)
+        val permissionIntent = PendingIntent.getBroadcast(
+            context, 0, 
+            Intent("com.example.pcremote.USB_PERMISSION"),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        usbManager.requestPermission(device, permissionIntent)
+        // 실제 구현에서는 BroadcastReceiver로 권한 응답 처리
+        return true  // 임시 반환
+    }
+    
+    private suspend fun connectUsb(device: UsbDevice) {
+        // USB 연결 설정 (실제 구현은 USB Host API 사용)
+        val connection = usbManager.openDevice(device)
+        // Serial 통신 설정 등
+    }
+    
+    private suspend fun connectBle(): Boolean {
+        // BLE HOGP 연결 (실제 구현은 BluetoothGatt API 사용)
+        return false  // 임시 반환
+    }
+}
+
+/**
+ * 8바이트 프레임 구조 (usb-hid-bridge-architecture.md §3 참조)
+ * Android → ESP32-S3로 전송되는 마우스 데이터 프레임
+ */
+data class MouseFrame(
+    val seq: UByte = 0u,           // 0: 순번 (유실/역전 감지용)
+    val buttons: UByte = 0u,       // 1: bit0=L, bit1=R, bit2=M
+    val dx: Short = 0,             // 2-3: 상대 X 이동 (Little-Endian)
+    val dy: Short = 0,             // 4-5: 상대 Y 이동 (Little-Endian)
+    val wheel: Byte = 0,           // 6: 휠 (BootSafe 모드에서는 0)
+    val flags: UByte = 0u          // 7: 플래그 비트
+) {
+    // 플래그 비트 정의
+    companion object {
+        const val FLAG_IS_KEEPALIVE: UByte = 0x01u
+        const val FLAG_EMERGENCY_STOP: UByte = 0x02u
+        const val FLAG_ACTIVE_CURSOR_ID: UByte = 0x04u
+        const val FLAG_RESERVED_SCROLLING: UByte = 0x08u
+        const val FLAG_RESERVED_RIGHT_ANGLE: UByte = 0x10u
+    }
+    
+    /**
+     * 8바이트 배열로 직렬화 (Little-Endian)
+     */
+    fun toByteArray(): ByteArray {
+        return ByteArray(8).apply {
+            this[0] = seq.toByte()
+            this[1] = buttons.toByte()
+            // dx를 Little-Endian으로 변환
+            this[2] = (dx and 0xFF).toByte()
+            this[3] = ((dx.toInt() shr 8) and 0xFF).toByte()
+            // dy를 Little-Endian으로 변환
+            this[4] = (dy and 0xFF).toByte()
+            this[5] = ((dy.toInt() shr 8) and 0xFF).toByte()
+            this[6] = wheel
+            this[7] = flags.toByte()
+        }
+    }
+}
+
+/**
+ * USB-Serial 통신 관리자
+ * CP2102를 통해 8바이트 마우스 프레임을 ESP32-S3로 전송
+ */
+class UsbSerialConnection @Inject constructor(
+    private val usbManager: UsbManager
+) {
+    private var connection: UsbDeviceConnection? = null
+    private var writeEndpoint: UsbEndpoint? = null
+    private var readEndpoint: UsbEndpoint? = null
+    private var sequenceNumber: UByte = 0u
+    
+    suspend fun connect(device: UsbDevice): Boolean = withContext(Dispatchers.IO) {
+        try {
+            connection = usbManager.openDevice(device)
+            val usbInterface = device.getInterface(0)
+            
+            // Bulk endpoints 찾기
+            for (i in 0 until usbInterface.endpointCount) {
+                val endpoint = usbInterface.getEndpoint(i)
+                when (endpoint.type) {
+                    UsbConstants.USB_ENDPOINT_XFER_BULK -> {
+                        if (endpoint.direction == UsbConstants.USB_DIR_OUT) {
+                            writeEndpoint = endpoint
+                        } else {
+                            readEndpoint = endpoint
+                        }
+                    }
+                }
+            }
+            
+            connection?.claimInterface(usbInterface, true)
+            
+            // CP2102 초기화 (보레이트 설정)
+            setSerialParameters()
+            
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    private fun setSerialParameters() {
+        // CP2102 보레이트 설정 (1 Mbps)
+        val baudRate = TransportConstants.UART_BAUD_RATE
+        connection?.controlTransfer(
+            0x21,  // SET_LINE_CODING
+            0x20,
+            0,
+            0,
+            byteArrayOf(
+                (baudRate and 0xFF).toByte(),
+                ((baudRate shr 8) and 0xFF).toByte(),
+                ((baudRate shr 16) and 0xFF).toByte(),
+                ((baudRate shr 24) and 0xFF).toByte(),
+                0,     // 1 stop bit
+                0,     // no parity
+                8      // 8 data bits
+            ),
+            7,
+            100
+        )
+    }
+    
+    suspend fun sendFrame(frame: MouseFrame): Boolean = withContext(Dispatchers.IO) {
+        val data = frame.copy(seq = sequenceNumber++).toByteArray()
+        val bytesWritten = connection?.bulkTransfer(
+            writeEndpoint,
+            data,
+            data.size,
+            TransportConstants.BULK_TRANSFER_TIMEOUT_MS
+        ) ?: -1
+        
+        bytesWritten == data.size
+    }
+    
+    fun sendKeepAlive() = runBlocking {
+        sendFrame(MouseFrame(flags = MouseFrame.FLAG_IS_KEEPALIVE))
+    }
+    
+    /**
+     * USB-Serial을 통해 수신된 데이터 읽기
+     * ESP32-S3가 Windows 서버로부터 받은 데이터를 중계
+     */
+    suspend fun startReceiver(onDataReceived: (ByteArray) -> Unit) = withContext(Dispatchers.IO) {
+        while (isActive) {
+            val buffer = ByteArray(64)
+            val bytesRead = connection?.bulkTransfer(
+                readEndpoint,
+                buffer,
+                buffer.size,
+                100  // 100ms 타임아웃
+            ) ?: -1
+            
+            if (bytesRead > 0) {
+                onDataReceived(buffer.copyOf(bytesRead))
+            }
+        }
+    }
+    
+    /**
+     * Windows 서버로 커스텀 명령 전송
+     * ESP32-S3가 Vendor/CDC 인터페이스로 PC에 전달
+     */
+    suspend fun sendCustomCommand(command: ByteArray): Boolean = withContext(Dispatchers.IO) {
+        // 커스텀 명령은 특별한 헤더로 구분 (예: 0xFF로 시작)
+        val data = byteArrayOf(0xFF.toByte()) + command
+        val bytesWritten = connection?.bulkTransfer(
+            writeEndpoint,
+            data,
+            data.size,
+            100
+        ) ?: -1
+        
+        bytesWritten == data.size
+    }
+    
+    fun disconnect() {
+        connection?.close()
+        connection = null
+    }
+}
+```
+
+#### 14.2 Windows 서버 감지 (USB 기반)
+```kotlin
+/**
+ * ESP32-S3를 통한 Windows 서버 감지
+ * Windows 서버가 Vendor/CDC 인터페이스로 연결되면 자동으로 인식
+ */
+class WindowsServerDetector @Inject constructor(
+    private val usbSerialConnection: UsbSerialConnection
+) {
+    sealed class ServerState {
+        object NotConnected : ServerState()
+        object Detecting : ServerState()
+        data class Connected(val version: String, val features: List<String>) : ServerState()
+    }
+    
+    private val _serverState = MutableStateFlow<ServerState>(ServerState.NotConnected)
+    val serverState: StateFlow<ServerState> = _serverState.asStateFlow()
+    
+    /**
+     * Windows 서버 감지 시작
+     * ESP32-S3를 통해 서버의 존재를 확인
+     */
+    suspend fun detectServer() {
+        _serverState.value = ServerState.Detecting
+        
+        // 서버 감지 명령 전송 (ESP32가 Vendor/CDC로 전달)
+        val detectCommand = "SERVER_DETECT".toByteArray()
+        if (usbSerialConnection.sendCustomCommand(detectCommand)) {
+            // 응답 대기 (2초 타임아웃)
+            withTimeoutOrNull(2000) {
+                usbSerialConnection.startReceiver { data ->
+                    val response = String(data)
+                    if (response.startsWith("SERVER_OK")) {
+                        // 서버 정보 파싱
+                        val parts = response.split(":")
+                        if (parts.size >= 3) {
+                            _serverState.value = ServerState.Connected(
+                                version = parts[1],
+                                features = parts[2].split(",")
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (_serverState.value is ServerState.Detecting) {
+            _serverState.value = ServerState.NotConnected
+        }
+    }
+    
+    /**
+     * Windows 서버와의 통신 (USB 경유)
+     * 모든 통신은 ESP32-S3의 Vendor/CDC 인터페이스를 통해 이루어짐
+     */
+    suspend fun sendToServer(message: String): Boolean {
+        return usbSerialConnection.sendCustomCommand(message.toByteArray())
+    }
+    
+    suspend fun startServerListener(onMessage: (String) -> Unit) {
+        usbSerialConnection.startReceiver { data ->
+            // 서버 메시지인지 확인 (0xFF 헤더 등으로 구분)
+            if (data.isNotEmpty() && data[0] == 0xFF.toByte()) {
+                val message = String(data, 1, data.size - 1)
+                onMessage(message)
+            }
+        }
+    }
+}
+```
+
+#### 14.3 Windows 서버 연결 관리 (USB 경유)
+```kotlin
+/**
+ * Windows 서버와의 연결을 관리한다.
+ * 모든 통신은 USB를 통해 ESP32-S3의 Vendor/CDC 인터페이스로 이루어진다.
+ */
+class WindowsServerConnection @Inject constructor(
+    private val serverDetector: WindowsServerDetector,
+    private val context: Context
+) {
+    sealed class ConnectionState {
+        object Disconnected : ConnectionState()
+        object Discovering : ConnectionState()
+        object Authenticating : ConnectionState()
+        object Connected : ConnectionState()
+        data class Error(val message: String) : ConnectionState()
+    }
+    
+    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
+    val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
+    
+    private var keepAliveJob: Job? = null
+    
+    suspend fun connect() = withContext(Dispatchers.IO) {
+        try {
+            // Phase 1: 서버 감지 (1-2초)
+            _connectionState.value = ConnectionState.Discovering
+            serverDetector.detectServer()
+            
+            val serverState = serverDetector.serverState.first { 
+                it !is WindowsServerDetector.ServerState.Detecting 
+            }
+            
+            if (serverState !is WindowsServerDetector.ServerState.Connected) {
+                throw Exception("Windows 서버를 찾을 수 없습니다")
+            }
+            
+            // Phase 2: 인증 (1-2초)
+            _connectionState.value = ConnectionState.Authenticating
+            val authenticated = performAuthentication()
+            if (!authenticated) throw Exception("인증 실패")
+            
+            // Phase 3: 상태 동기화 (1-2초)
+            val syncResult = performStateSync()
+            
+            _connectionState.value = ConnectionState.Connected
+            
+            // Keep-alive 시작
+            startKeepAlive()
+            
+        } catch (e: Exception) {
+            _connectionState.value = ConnectionState.Error(e.message ?: "연결 실패")
+            disconnect()
+        }
+    }
+    
+    private suspend fun performAuthentication(): Boolean {
+        // USB를 통한 인증 (ESP32-S3 경유)
+        val deviceId = Settings.Secure.getString(
+            context.contentResolver, 
+            Settings.Secure.ANDROID_ID
+        )
+        
+        // 인증 요청 전송
+        val authRequest = """{"type":"AUTH","deviceId":"$deviceId"}"""
+        serverDetector.sendToServer(authRequest)
+        
+        // 응답 대기
+        return withTimeoutOrNull(2000) {
+            suspendCancellableCoroutine { cont ->
+                viewModelScope.launch {
+                    serverDetector.startServerListener { message ->
+                        if (message.contains("AUTH_OK")) {
+                            cont.resume(true)
+                        }
+                    }
+                }
+            }
+        } ?: false
+    }
+    
+    private suspend fun performStateSync(): Map<String, Any> {
+        // 상태 동기화 요청
+        serverDetector.sendToServer("""{"type":"STATE_SYNC"}""")
+        
+        // 응답 대기 및 파싱
+        return withTimeoutOrNull(2000) {
+            suspendCancellableCoroutine { cont ->
+                viewModelScope.launch {
+                    serverDetector.startServerListener { message ->
+                        if (message.startsWith("{") && message.contains("mode")) {
+                            cont.resume(parseJsonResponse(message))
+                        }
+                    }
+                }
+            }
+        } ?: emptyMap()
+    }
+    
+    private fun parseJsonResponse(json: String): Map<String, Any> {
+        // 실제 구현에서는 JSON 파싱 라이브러리 사용 (Gson, Moshi 등)
+        return mapOf("mode" to "Normal", "features" to listOf("multiCursor", "macro"))
+    }
+    
+    private fun disconnect() {
+        keepAliveJob?.cancel()
+        _connectionState.value = ConnectionState.Disconnected
+    }
+}
+```
+
+#### 14.4 Keep-alive 및 재연결
+```kotlin
+/**
+ * ServerConnection 클래스에 추가할 Keep-alive 및 재연결 메서드들.
+ * 5초 주기로 연결 상태를 확인하고, 문제 발생 시 재연결한다.
+ */
+// ServerConnection 클래스 내부에 다음 메서드들을 추가
+class ServerConnection {
+    // ... 기존 코드 ...
+    
+    private fun startKeepAlive() {
+        keepAliveJob = CoroutineScope(Dispatchers.IO).launch {
+            var missedCount = 0
+            
+            while (isActive) {
+                delay(TransportConstants.KEEP_ALIVE_INTERVAL_MS)  // 5000ms
+                
+                if (!sendKeepAlive()) {
+                    missedCount++
+                    if (missedCount >= TransportConstants.KEEP_ALIVE_MISSED_THRESHOLD) {  // 3회
+                        _connectionState.value = ConnectionState.Error("연결 불안정")
+                        reconnectWithBackoff()
+                        break
+                    }
+                } else {
+                    missedCount = 0
+                }
+            }
+        }
+    }
+    
+    private suspend fun reconnectWithBackoff() {
+        disconnect()
+        
+        val backoffDelays = listOf(1000L, 2000L, 4000L, 8000L)  // 1s, 2s, 4s, 8s
+        
+        for ((attempt, delay) in backoffDelays.withIndex()) {
+            delay(delay)
+            
+            try {
+                connect()
+                if (connectionState.value is ConnectionState.Connected) {
+                    showToast("재연결되었습니다", ToastType.SUCCESS)
+                    break
+                }
+            } catch (e: Exception) {
+                if (attempt == backoffDelays.lastIndex) {
+                    showToast("재연결 실패", ToastType.ERROR)
+                }
+            }
+        }
+    }
+    
+    private suspend fun sendKeepAlive(): Boolean {
+        return try {
+            val writer = socket?.getOutputStream()?.bufferedWriter() ?: return false
+            writer.write("""{"type":"PING"}""")
+            writer.newLine()
+            writer.flush()
+            
+            // 1초 내 PONG 응답 확인
+            withTimeoutOrNull(1000) {
+                val reader = socket?.getInputStream()?.bufferedReader()
+                reader?.readLine()?.contains("PONG") == true
+            } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+    
+    private fun showToast(message: String, type: ToastType) {
+        // 실제 구현에서는 Context나 SnackbarHostState를 통해 표시
+        // 여기서는 로그로 대체
+        when (type) {
+            ToastType.INFO -> Log.i("ServerConnection", message)
+            ToastType.SUCCESS -> Log.i("ServerConnection", "✓ $message")
+            ToastType.ERROR -> Log.e("ServerConnection", "✗ $message")
+        }
+    }
+}
+
+enum class ToastType {
+    INFO, SUCCESS, ERROR
+}
+```
+
+#### 14.5 상태 동기화 (BootSafe/Normal)
+```kotlin
+/**
+ * 서버와 동글로부터 수신한 정보를 기반으로 앱 모드를 결정한다.
+ * BootSafe: BIOS/로그인 화면, Normal: OS 진입 후
+ */
+sealed class AppMode {
+    object BootSafe : AppMode()
+    object Normal : AppMode()
+}
+
+class AppStateViewModel @Inject constructor(
+    private val transportManager: TransportManager,
+    private val serverConnection: ServerConnection
+) : ViewModel() {
+    private val _appMode = MutableStateFlow<AppMode>(AppMode.BootSafe)
+    val appMode: StateFlow<AppMode> = _appMode.asStateFlow()
+    
+    init {
+        // 모드 전환 감지
+        viewModelScope.launch {
+            combine(
+                transportManager.transportState,
+                serverConnection.connectionState
+            ) { transport, connection ->
+                determineAppMode(transport, connection)
+            }.collect { mode ->
+                if (mode != _appMode.value) {
+                    _appMode.value = mode
+                    onModeChanged(mode)
+                }
+            }
+        }
+    }
+    
+    private fun determineAppMode(
+        transport: TransportState,
+        connection: ServerConnection.ConnectionState
+    ): AppMode {
+        // Normal 모드 조건 (둘 중 하나 충족)
+        // 1. 동글이 SET_PROTOCOL=REPORT 감지
+        // 2. Windows 서버와 5초 내 핸드셰이크 성공
+        
+        return when {
+            transport !is TransportState.UsbReady && 
+            transport !is TransportState.BleReady -> AppMode.BootSafe
+            
+            connection is ServerConnection.ConnectionState.Connected -> AppMode.Normal
+            
+            isDongleReportedNormalMode() -> AppMode.Normal  // 동글 Notify
+            
+            else -> AppMode.BootSafe
+        }
+    }
+    
+    private fun onModeChanged(mode: AppMode) {
+        when (mode) {
+            AppMode.Normal -> {
+                showToast("OS 모드로 전환되었습니다", ToastType.INFO)
+                performHapticFeedback(HapticType.MODE_CHANGE)
+            }
+            AppMode.BootSafe -> {
+                showToast("BIOS 모드", ToastType.INFO)
+            }
+        }
+    }
+    
+    private fun isDongleReportedNormalMode(): Boolean {
+        // 동글로부터 SET_PROTOCOL=REPORT 신호를 받았는지 확인
+        // 실제 구현에서는 TransportManager에서 이 정보를 관리
+        return false  // 임시 반환
+    }
+    
+    private fun showToast(message: String, type: ToastType) {
+        // UI 레이어로 토스트 이벤트 전달
+        // 실제 구현에서는 SharedFlow나 Channel 사용
+    }
+    
+    private fun performHapticFeedback(type: HapticType) {
+        // 햅틱 피드백 이벤트 전달
+        // 실제 구현에서는 UI 레이어에서 처리
+    }
+}
+
+enum class HapticType {
+    BUTTON_PRESS, MODE_CHANGE, ERROR
+}
+```
+
+#### 14.6 통합 연결 플로우 예제
+```kotlin
+/**
+ * 앱 시작 시 전체 연결 플로우를 관리하는 예제.
+ * 1. USB-Serial (CP2102) 연결 → ESP32-S3로 마우스 데이터 전송
+ * 2. 네트워크로 Windows 서버 탐색 → 고급 기능 활성화
+ */
+@Composable
+fun ConnectionFlow(
+    viewModel: ConnectionViewModel = hiltViewModel()
+) {
+    val transportState by viewModel.transportState.collectAsStateWithLifecycle()
+    val serverState by viewModel.serverConnectionState.collectAsStateWithLifecycle()
+    val appMode by viewModel.appMode.collectAsStateWithLifecycle()
+    
+    LaunchedEffect(Unit) {
+        // 1. USB-Serial 어댑터 연결 (마우스 제어용)
+        viewModel.startTransportDiscovery()
+    }
+    
+    LaunchedEffect(transportState) {
+        // 2. USB 연결 성공 시 Windows 서버 탐색 (선택적)
+        if (transportState is TransportState.UsbReady) {
+            // 네트워크로 서버 연결 시도 (고급 기능용)
+            viewModel.connectToServer()
+            
+            // USB-Serial로 마우스 데이터 전송 시작
+            viewModel.startMouseTransmission()
+        }
+    }
+    
+    // UI 표시
+    Column {
+        ConnectionStatusCard(
+            transportState = transportState,
+            serverState = serverState,
+            appMode = appMode
+        )
+        
+        // 터치패드 UI (USB-Serial로 8바이트 프레임 전송)
+        TouchpadArea(
+            onMove = { dx, dy -> 
+                viewModel.sendMouseMove(dx, dy)
+            },
+            onButton = { button, pressed ->
+                viewModel.sendMouseButton(button, pressed)
+            }
+        )
+        
+        when (appMode) {
+            AppMode.BootSafe -> {
+                Text("BIOS 모드 - 기본 마우스 기능만 사용 가능")
+            }
+            AppMode.Normal -> {
+                Text("OS 모드 - 휠 및 고급 기능 사용 가능")
+                // 서버 연결 시 추가 UI 표시
+                if (serverState is ServerConnection.ConnectionState.Connected) {
+                    AdvancedFeatures()
+                }
+            }
+        }
+    }
+}
+
+/**
+ * ViewModel에 추가할 마우스 제어 메서드
+ */
+class ConnectionViewModel @Inject constructor(
+    private val transportManager: TransportManager,
+    private val serverConnection: ServerConnection,
+    private val usbSerialConnection: UsbSerialConnection
+) : ViewModel() {
+    // ... 기존 코드 ...
+    
+    fun sendMouseMove(dx: Int, dy: Int) {
+        viewModelScope.launch {
+            val frame = MouseFrame(
+                dx = dx.toShort(),
+                dy = dy.toShort()
+            )
+            usbSerialConnection.sendFrame(frame)
+        }
+    }
+    
+    fun sendMouseButton(button: Int, pressed: Boolean) {
+        viewModelScope.launch {
+            val currentButtons = // 현재 버튼 상태 관리
+            val frame = MouseFrame(
+                buttons = updateButtonState(currentButtons, button, pressed)
+            )
+            usbSerialConnection.sendFrame(frame)
+        }
+    }
+    
+    fun startMouseTransmission() {
+        // 4-8ms 주기로 마우스 데이터 전송
+        viewModelScope.launch {
+            while (isActive) {
+                delay(TransportConstants.TX_PERIOD_MS)
+                // 필요 시 프레임 전송
+            }
+        }
+    }
+}
+```
+
+### 15. 권장 적용 순서
+1) Theme/토큰 정리 → 2) App Scaffold + NavHost → 3) ViewModel 상태/수명주기 구독 → 4) Snackbar/Haptic → 5) Pager → 6) Foreground Service → 7) 권한/USB Host 스켈레톤 → 8) Transport Manager → 9) Server Discovery/Connection → 10) 페이지별 뼈대 화면
+
+### 16. 참고(공식/레퍼런스)
+- Material 3/Adaptive UI: Reply, JetNews 샘플(`android/compose-samples`) — Navigation/Scaffold/Theming 패턴
+- ViewModel/StateFlow 구독: `collectAsStateWithLifecycle()`
+- Foundation Pager: `androidx.compose.foundation.pager.*`
+- Haptic: `LocalHapticFeedback` API
+- Foreground Service: Android 공식 문서(알림 채널, startForeground)
+- USB Host: Android 공식 문서(UsbManager, 권한 브로드캐스트)
+- 코루틴: Kotlin 공식 문서 (Structured Concurrency, Flow)
+- ESP32-S3 복합 장치 구현: [ESP-IDF Issue #15650](https://github.com/espressif/esp-idf/issues/15650) — HID+CDC 복합 장치 구현 예제 (게임패드+CDC, 마우스로 응용 가능)
+- 프로젝트 명세서: 
+  - `Docs/implementation-guide.md` — ESP32-S3 복합 장치 구현 가이드
+  - `Docs/usb-hid-bridge-architecture.md` — USB HID 브리지 아키텍처
+  - `Docs/backend-server.md` — Windows 서버 프로토콜 및 핸드셰이크
+  - `Docs/technical-specification.md` — 상수 정의 및 프로토콜 명세
+  - `Docs/design-guide-app.md` — 연결 플로우 및 UI 상태 관리

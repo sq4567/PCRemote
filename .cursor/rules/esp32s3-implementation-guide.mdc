@@ -1,0 +1,840 @@
+## ESP32‑S3 코드 구현 가이드 — Geekble nano ESP32‑S3 (PlatformIO + 공식 예제 기반)
+
+본 문서는 VSCode의 PlatformIO 익스텐션이 설치/준비되어 있다는 전제하에, 보드 모델 `Geekble nano ESP32‑S3` 기준으로 USB HID(Mouse/Keyboard) 동글 펌웨어를 구현하기 위한 최소-필수 설정, 예제 코드, 테스트 방법을 제공합니다. 프로젝트 전반 설계는 `Docs/usb-hid-bridge-architecture.md` §6(ESP‑IDF/TinyUSB)과 정합성을 유지합니다. UI 문서의 '활성/비활성' 표기는 Selected/Unselected, Enabled/Disabled로 일관 매핑합니다.
+
+### 보드 개요 — Geekble nano ESP32‑S3
+- 자료 위치: `@Geekble-nano-ESP32S3/`
+  - 핀맵: `PinMap/Geekble nano PinMap.png` (필수 확인)
+  - 회로도: `Schematic/Geekble_nano_Ver.2.5_Schematic.pdf`
+  - 치수: `Dimension/Geekble nano Dimension.pdf`
+  - 3D: `3D/Geekble_nano_Ver.2.5.step`
+- 전원: v2.0부터 5V Buck‑Boost + 3.3V LDO 구조(README 참조)
+- 업로드/부트: BOOT(GPIO0) + RESET(EN) 조합으로 다운로드 모드 진입 가능(일반 ESP32‑S3 절차 동일)
+- USB: ESP32‑S3 내부 USB(Full‑Speed). USB D−/D+ 핀은 보드 회로도 기준으로 확인(일반적으로 S3 디폴트는 IO19/IO20이나, 반드시 `Ver.2.5` 회로도에서 최종 확인)
+
+### 목표
+- ESP32‑S3 장치가 USB HID(Mouse/Keyboard)로 Host(Windows)에서 인식되도록 함
+- CDC(USB Serial)로 로깅/진단 가능하도록 설정
+- PCRemote 프로토콜(8B 프레임) → HID 분할 주입을 위한 코드 스켈레톤 제공
+
+### 참고 구성 환경
+- `Board/PCRemote/` 폴더에 완전한 PlatformIO 프로젝트가 구축되어 있습니다.
+- Geekble nano ESP32-S3 보드 정의(`boards/geekble_nano_esp32s3.json`) 포함
+- `platformio.ini`에서 `geekble-nano-esp32s3` 환경으로 직접 빌드 가능
+
+## 1. 프로젝트 사용법
+
+`Board/PCRemote/` 폴더의 구축된 환경 사용:
+
+```bash
+cd Board/PCRemote/
+pio run -e geekble-nano-esp32s3          # 빌드
+pio run -e geekble-nano-esp32s3 -t upload   # 업로드
+pio device monitor                           # 시리얼 모니터
+```
+
+현재 환경: `geekble-nano-esp32s3` (Arduino 프레임워크, USB HID/CDC 활성화)
+
+## 2. Arduino 프레임워크: USB HID + CDC
+
+### 2.1 기본 Blink(환경 확인)
+
+```cpp
+#include <Arduino.h>
+
+/**
+ * @brief 기본 LED 블링크로 보드/툴체인 정상 동작 확인.
+ */
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+}
+
+void loop() {
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(500);
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(500);
+}
+```
+
+### 2.2 USB CDC(시리얼) 활성화
+- `platformio.ini`에 `-D ARDUINO_USB_CDC_ON_BOOT=1`, `-D ARDUINO_USB_MODE=1` 설정으로 USB CDC 사용
+- 시리얼 모니터는 PlatformIO `Monitor`로 115200bps 설정
+
+```cpp
+#include <Arduino.h>
+
+/**
+ * @brief USB CDC 시리얼 초기화 및 주기적 로그 출력.
+ */
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { /* USB CDC 준비 대기 */ }
+  Serial.println("USB CDC ready (Geekble nano ESP32-S3)");
+}
+
+void loop() {
+  Serial.println("tick");
+  delay(1000);
+}
+```
+
+### 2.3 USB HID Mouse 예제
+Arduino‑ESP32 USB API(공식): 제품 문자열/VID/PID 설정 및 HID Mouse 시작. 개발 단계에서는 기본 VID(0x303A) 사용, 상용 출시는 고유 VID 필요.
+
+```cpp
+#include <Arduino.h>
+#include <USB.h>
+#include <USBHIDMouse.h>
+
+#ifndef GEEKBLE_LED_PIN
+#define GEEKBLE_LED_PIN LED_BUILTIN  // 핀맵 확인 후 필요 시 -D GEEKBLE_LED_PIN=GPIO 로 오버라이드
+#endif
+
+USBHIDMouse hidMouse;
+
+/**
+ * @brief USB 장치 식별자/문자열을 설정하고 HID Mouse를 시작합니다.
+ */
+void setup() {
+  pinMode(GEEKBLE_LED_PIN, OUTPUT);
+  digitalWrite(GEEKBLE_LED_PIN, LOW);
+
+  Serial.begin(115200);
+
+  USB.manufacturerName("PCRemote");
+  USB.productName("PCRemote Dongle — Geekble nano ESP32-S3");
+  USB.serialNumber("S3-DEV-0001");
+  USB.VID(0x303A); // Espressif 개발용 기본 VID
+  USB.PID(0x4001); // 예시 PID
+
+  USB.begin();
+  hidMouse.begin();
+
+  Serial.println("USB HID Mouse ready");
+}
+
+/**
+ * @brief 간단한 마우스 이동을 주기적으로 전송합니다.
+ */
+void loop() {
+  // Host에서 장치 인식 후 작은 이동(우측으로 2픽셀) 반복
+  hidMouse.move(2, 0, 0); // dx, dy, wheel
+  digitalWrite(GEEKBLE_LED_PIN, !digitalRead(GEEKBLE_LED_PIN));
+  delay(10);
+}
+```
+
+필요 시 Keyboard도 유사하게 `#include <USBHIDKeyboard.h>` 및 `USBHIDKeyboard keyboard; keyboard.begin(); keyboard.print("...");` 형태로 사용합니다.
+
+## 3. ESP‑IDF + TinyUSB: HID 구현(PlatformIO)
+
+ESP‑IDF에서는 TinyUSB 디바이스 스택을 사용합니다. 기본 디스크립터를 사용하면 최소 설정만으로 동작합니다.
+
+### 3.1 sdkconfig.defaults
+`[env:...-idf]`에서 참조할 `sdkconfig.defaults` 예시:
+
+```properties
+CONFIG_TINYUSB_ENABLED=y
+CONFIG_TINYUSB_DEVICE_ENABLED=y
+CONFIG_TINYUSB_HID_ENABLED=y
+CONFIG_TINYUSB_CDC_ENABLED=y
+```
+
+### 3.2 최소 코드 스켈레톤(src/main.c)
+
+```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_check.h"
+#include "tinyusb.h"
+#include "class/hid/hid_device.h"
+
+// Google 스타일 Docstring 유사 형식(Doxygen 호환)
+/**
+ * @brief HID 마우스 리포트를 주기적으로 전송하는 태스크.
+ *
+ * 마우스 커서를 오른쪽으로 미세 이동시키는 예제입니다. Host 인식 확인용.
+ * @param pvParameters FreeRTOS 태스크 파라미터(미사용)
+ */
+static void hid_task(void *pvParameters) {
+    (void)pvParameters;
+    for (;;) {
+        if (tud_hid_ready()) {
+            // report_id=0, buttons=0, dx=2, dy=0, wheel=0, pan=0
+            tud_hid_mouse_report(0, 0x00, 2, 0, 0, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/**
+ * @brief TinyUSB 드라이버 설치 및 HID 태스크 시작.
+ */
+void app_main(void) {
+    tinyusb_config_t tusb_cfg = { 0 }; // 기본 디스크립터 사용
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+    xTaskCreate(hid_task, "hid_task", 4096, NULL, 5, NULL);
+}
+```
+
+공식 예제 로그(참고): TinyUSB 드라이버 설치 및 디바이스 디스크립터 요약이 시리얼에 출력됩니다.
+
+### 3.3 Geekble 프리셋: sdkconfig.defaults + TinyUSB 설정
+
+아래 프리셋은 Geekble nano ESP32‑S3 보드에서 HID/CDC를 기본 활성화하고, 로그 레벨/컬러 로그를 설정합니다. 콘솔 출력 경로는 두 가지 옵션 중 하나를 선택하십시오.
+
+```properties
+# TinyUSB/HID/CDC
+CONFIG_TINYUSB_ENABLED=y
+CONFIG_TINYUSB_DEVICE_ENABLED=y
+CONFIG_TINYUSB_HID_ENABLED=y
+CONFIG_TINYUSB_CDC_ENABLED=y
+
+# 로그 레벨/색상 (INFO)
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+CONFIG_LOG_COLORS=y
+
+# 콘솔 출력 경로 (택1)
+# 1) USB‑Serial‑JTAG로 콘솔 출력 (ESP32‑S3 내장)
+#CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+#CONFIG_ESP_CONSOLE_UART=n
+
+# 2) 기본 UART 콘솔 유지(필요 시) — TinyUSB CDC는 애플리케이션용으로 별도 사용
+#CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n
+#CONFIG_ESP_CONSOLE_UART=y
+```
+
+VBUS 감지는 TinyUSB 드라이버 설치 시 코드 레벨에서 설정합니다(보드 회로도에 VBUS 센싱 라인이 존재하는 경우). `Schematic/Geekble_nano_Ver.2.5_Schematic.pdf`의 VBUS → GPIO 연결을 확인한 뒤, 해당 GPIO로 설정하세요.
+
+```c
+#include "driver/gpio.h"
+
+static void geekble_tinyusb_init_with_vbus(void) {
+    tinyusb_config_t tusb_cfg = { 0 };
+    tusb_cfg.self_powered = false;            // 버스 전원 구동(일반 PC 연결)
+    tusb_cfg.vbus_monitor_io = -1;            // Geekble nano ESP32-S3 v2.5: VBUS 감지 GPIO 미배선
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+}
+```
+
+참고: VBUS 센싱 회로가 없다면 `vbus_monitor_io = -1;`로 두거나 기본 구성을 사용하세요.
+
+## 4. PCRemote 프로토콜(8B 프레임) → HID 분할 주입 스켈레톤
+
+프로토콜 상세는 `Docs/usb-hid-bridge-architecture.md` 및 중앙 스펙 문서에 따릅니다. 아래는 프레임을 받아 HID로 주입하는 공통 스켈레톤입니다.
+
+### 4.1 프로토콜 프레임 형식 (참조)
+
+| 바이트 | 필드    | 형식  | 설명                                  |
+|------:|---------|-------|---------------------------------------|
+| 0     | seq     | u8    | 순번(유실/역전 로깅용)                |
+| 1     | buttons | u8    | bit0 L, bit1 R, bit2 M                |
+| 2..3  | dx      | i16   | 상대 X (Little-Endian)                |
+| 4..5  | dy      | i16   | 상대 Y (Little-Endian)                |
+| 6     | wheel   | i8    | 휠(부트 단계 비사용, OS 진입 후 선택) |
+| 7     | flags   | u8    | 플래그 비트 (아래 참조)               |
+
+플래그 비트 정의:
+- bit0: `IS_KEEPALIVE` - 헬스체크 프레임
+- bit1: `EMERGENCY_STOP` - 즉시 중립화
+- bit2: `ACTIVE_CURSOR_ID` - 멀티 커서 (0=A, 1=B)
+- bit3-7: 예약
+
+### 4.2 Arduino 프레임워크 구현
+
+```cpp
+#include <stdint.h>
+#include <HardwareSerial.h>
+#include <USBHIDMouse.h>
+
+// UART 설정 (예: Serial1 사용)
+#define UART_BAUD_RATE 1000000
+HardwareSerial UartBridge(1);  // UART1
+USBHIDMouse Mouse;
+
+// 프레임 버퍼
+uint8_t frameBuffer[8];
+size_t frameIndex = 0;
+
+void setup() {
+    // UART 초기화 (RX=17, TX=18)
+    UartBridge.begin(UART_BAUD_RATE, SERIAL_8N1, 17, 18);
+    
+    // USB HID 초기화
+    USB.begin();
+    Mouse.begin();
+}
+
+void loop() {
+    // UART에서 바이트 읽기
+    while (UartBridge.available()) {
+        frameBuffer[frameIndex++] = UartBridge.read();
+        
+        // 8바이트 완성 시 처리
+        if (frameIndex >= 8) {
+            processFrame(frameBuffer);
+            frameIndex = 0;
+        }
+    }
+}
+
+/**
+ * @brief 8바이트 프레임을 파싱하여 HID 이벤트로 변환합니다.
+ */
+void processFrame(const uint8_t frame[8]) {
+    uint8_t seq = frame[0];
+    uint8_t buttons = frame[1];
+    int16_t dx = (int16_t)((frame[3] << 8) | frame[2]);  // Little-Endian
+    int16_t dy = (int16_t)((frame[5] << 8) | frame[4]);
+    int8_t wheel = (int8_t)frame[6];
+    uint8_t flags = frame[7];
+    
+    // Keep-alive 프레임은 스킵
+    if (flags & 0x01) return;
+    
+    // 긴급 정지
+    if (flags & 0x02) {
+        buttons = 0;
+        dx = dy = wheel = 0;
+    }
+    
+    // HID 분할 주입
+    injectMouseHID(buttons, dx, dy, wheel);
+}
+
+/**
+ * @brief i16 델타를 HID 규격으로 분할 주입
+ */
+void injectMouseHID(uint8_t buttons, int16_t dx, int16_t dy, int8_t wheel) {
+    // 버튼 상태 먼저 반영
+    static uint8_t lastButtons = 0;
+    if (buttons != lastButtons) {
+        Mouse.buttons(buttons);
+        lastButtons = buttons;
+    }
+    
+    // 이동 분할 (Arduino API는 자동 분할 지원)
+    Mouse.move(dx, dy, wheel);
+}
+```
+
+### 4.3 ESP-IDF/TinyUSB 구현
+
+```cpp
+#include <stdint.h>
+#include "driver/uart.h"
+#include "tinyusb.h"
+#include "class/hid/hid_device.h"
+
+#define UART_PORT_NUM UART_NUM_1
+#define UART_TX_PIN 18
+#define UART_RX_PIN 17
+#define UART_BAUD_RATE 1000000
+
+/**
+ * @brief 8바이트 프레임을 파싱하여 HID 이벤트로 변환합니다.
+ *
+ * @param frame 8바이트 입력 버퍼
+ */
+static void injectMouseReportFromFrame(const uint8_t frame[8]) {
+    uint8_t seq = frame[0];
+    uint8_t buttons = frame[1];
+    int16_t rawX = (int16_t)((frame[3] << 8) | frame[2]);
+    int16_t rawY = (int16_t)((frame[5] << 8) | frame[4]);
+    int8_t wheel = (int8_t)frame[6];
+    uint8_t flags = frame[7];
+    
+    // Keep-alive 처리
+    if (flags & 0x01) {
+        // 연결 상태 업데이트만
+        return;
+    }
+    
+    // 긴급 정지
+    if (flags & 0x02) {
+        buttons = 0;
+        rawX = rawY = wheel = 0;
+    }
+    
+    // i16 → [-127,127] 클램프 후 분할 전송
+    int32_t remainingX = rawX;
+    int32_t remainingY = rawY;
+    
+    while (remainingX != 0 || remainingY != 0) {
+        int8_t dx = (remainingX > 127) ? 127 : (remainingX < -127 ? -127 : (int8_t)remainingX);
+        int8_t dy = (remainingY > 127) ? 127 : (remainingY < -127 ? -127 : (int8_t)remainingY);
+        
+        if (tud_hid_ready()) {
+            tud_hid_mouse_report(0, buttons, dx, dy, wheel, 0);
+        }
+        
+        remainingX -= dx;
+        remainingY -= dy;
+        
+        // 분할 전송 간 지연
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+```
+
+주의: 페이지/컴포넌트 입력 차단 상태는 Enabled/Disabled, 선택 상태는 Selected/Unselected로 관리하며, 동글 펌웨어는 입력 주입만 담당합니다.
+
+## 5. 빌드/플래시/모니터
+- Build: PlatformIO 사이드바에서 환경 선택 후 Build
+- Upload: USB 연결 상태에서 Upload (필요 시 BOOT+RESET 진입)
+- Monitor: 115200bps로 출력 확인
+
+추가 팁(Windows): 업로드 포트가 자주 바뀌면 `platformio.ini`에 다음을 명시합니다.
+
+```ini
+upload_port = COM5      ; 실제 포트로 교체
+monitor_port = COM5
+```
+
+ESP‑IDF의 경우 `idf.py -p PORT flash monitor` 동작과 동일하게 PlatformIO가 수행합니다.
+
+## 6. 테스트(Windows)
+- 장치 관리자에 ‘USB Serial Device (COMx)’(CDC) 및 ‘HID‑compliant mouse/keyboard’가 인식되는지 확인
+- 마우스 포인터가 미세하게 이동하면 HID 전송 정상
+
+## 7. 문제 해결(Troubleshooting)
+- 업로드 실패 시: BOOT 버튼을 누른 채 RESET 후 업로드 재시도
+- 새 포트 미인식: 케이블 교체, 전원 충분성 점검, 드라이버 재검색
+- HID 동작 불안정: 전송 주기/분할주입 크기 조정, 호스트 전력 관리 옵션 확인
+ - LED가 점등되지 않으면: 핀맵(`@Geekble-nano-ESP32S3/PinMap/...`)에서 보드 LED GPIO 재확인 후 `-D GEEKBLE_LED_PIN=GPIO`로 오버라이드
+
+## 8. 레퍼런스(공식)
+- Arduino‑ESP32 USB API: `USB.begin`, `VID/PID`, `productName`, `manufacturerName`
+- Arduino USB HID Mouse/Keyboard 예제(`USBHIDMouse`, `USBHIDKeyboard`)
+- ESP‑IDF TinyUSB HID Device 예제(`tud_hid_mouse_report`, `tinyusb_driver_install`)
+- PlatformIO 보드 ID: `esp32-s3-devkitc-1`, `esp32s3usbotg`, `seeed_xiao_esp32s3`, `lolin_s3`
+
+## 9. 보드 전용 참고(Geekble nano ESP32‑S3)
+- 핀맵: `Geekble-nano-ESP32S3/PinMap/Geekble nano PinMap.png`
+- 회로도: `Geekble-nano-ESP32S3/Schematic/Geekble_nano_Ver.2.5_Schematic.pdf`
+- 치수: `Geekble-nano-ESP32S3/Dimension/Geekble nano Dimension.pdf`
+- 버전 로그(요약): v2.0 전원 구조 변경, v2.5 안테나 임피던스 매칭 보정(README 참고)
+
+## 10. 보드 제작자 예제 코드 분석 및 활용
+
+보드 제작자가 제공한 예제 코드(Board/PCRemote/examples/)에서 PCRemote 프로젝트에 활용 가능한 핵심 패턴들을 분석했습니다.
+
+### 10.1 예제 코드 개요
+
+제공된 예제 3개:
+1. `hid_mouse_keyboard_composite.cpp`: 마우스/키보드 복합 HID 장치 구현
+2. `keyboard_repeat.cpp`: 키보드 반복 입력 처리
+3. `mode_select_mouse_keyboard.cpp`: 모드 선택으로 마우스/키보드 전환
+
+### 10.2 핵심 디자인 패턴
+
+#### 디바운스 처리 (모든 예제 공통)
+```cpp
+#define DEBOUNCE_MS 40  // 40-50ms 권장
+
+// 디바운스 상태 관리
+bool lastStableState[NUM_INPUTS];     // 안정화된 상태
+bool lastReading[NUM_INPUTS];         // 즉시 읽은 값
+unsigned long lastChangeTime[NUM_INPUTS];  // 마지막 변경 시각
+
+void debounceAll() {
+    unsigned long now = millis();
+    for (size_t i = 0; i < NUM_INPUTS; i++) {
+        bool reading = /* 입력 읽기 */;
+        if (reading != lastReading[i]) {
+            lastReading[i] = reading;
+            lastChangeTime[i] = now;
+        }
+        // 충분한 시간 유지 시 안정 상태로 채택
+        if ((now - lastChangeTime[i]) > DEBOUNCE_MS) {
+            if (reading != lastStableState[i]) {
+                lastStableState[i] = reading;
+                // 상태 변경 처리...
+            }
+        }
+    }
+}
+```
+
+#### 에지 트리거 vs 홀드 반복
+```cpp
+// 1. 에지 트리거 (클릭, 단일 키 입력)
+bool pressedEdgeFired[NUM_INPUTS];
+
+void doOnPressOnce(int input, void (*action)()) {
+    if (lastStableState[input] == PRESSED && !pressedEdgeFired[input]) {
+        pressedEdgeFired[input] = true;
+        action();
+    }
+}
+
+// 2. 홀드 반복 (마우스 이동, 스크롤, 방향키)
+#define INITIAL_REPEAT_DELAY_MS 300  // 첫 반복까지 지연
+#define REPEAT_INTERVAL_MS 30        // 반복 간격
+
+void handleHoldRepeat(int input, void (*action)()) {
+    if (lastStableState[input] == PRESSED) {
+        unsigned long now = millis();
+        if (firstPressTime[input] == 0) {
+            firstPressTime[input] = now;
+            action();  // 즉시 첫 동작
+        } else if ((now - firstPressTime[input]) >= INITIAL_REPEAT_DELAY_MS) {
+            if ((now - lastRepeatTime[input]) >= REPEAT_INTERVAL_MS) {
+                action();
+                lastRepeatTime[input] = now;
+            }
+        }
+    }
+}
+```
+
+### 10.3 PCRemote 적용 방안
+
+#### UART 프레임 유효성 검증에 디바운스 개념 적용
+```cpp
+// 8바이트 프레임 수신 시 유효성 검증
+typedef struct {
+    uint8_t buffer[8];
+    uint32_t timestamp;
+    bool isValid;
+} FrameBuffer;
+
+#define FRAME_TIMEOUT_MS 50  // 프레임 타임아웃
+
+bool validateFrame(const uint8_t frame[8]) {
+    // seq 연속성 체크
+    static uint8_t lastSeq = 0;
+    uint8_t expectedSeq = (lastSeq + 1) & 0xFF;
+    
+    // flags 유효성 체크
+    uint8_t flags = frame[7];
+    bool isKeepAlive = flags & 0x01;
+    
+    // 델타 값 범위 체크 (프로토콜 명세 참조)
+    int16_t dx = (frame[3] << 8) | frame[2];
+    int16_t dy = (frame[5] << 8) | frame[4];
+    
+    if (isKeepAlive) {
+        return true;  // Keep-alive는 항상 유효
+    }
+    
+    // 비정상적으로 큰 델타 값 필터링
+    if (abs(dx) > 32767 || abs(dy) > 32767) {
+        return false;
+    }
+    
+    lastSeq = frame[0];
+    return true;
+}
+```
+
+#### 입력 모드 상태 관리
+```cpp
+// PCRemote 모드 상태 (Boot-safe vs Normal)
+typedef enum {
+    MODE_BOOT_SAFE,    // BIOS/로그인 화면용
+    MODE_NORMAL        // OS 진입 후
+} OperationMode;
+
+OperationMode currentMode = MODE_BOOT_SAFE;
+
+// 모드별 동작 제한
+void processHIDReport(const uint8_t frame[8]) {
+    if (currentMode == MODE_BOOT_SAFE) {
+        // Boot-safe 모드: 휠/우클릭/매크로 비활성
+        uint8_t buttons = frame[1] & 0x01;  // 좌클릭만 허용
+        int8_t wheel = 0;  // 휠 강제 비활성
+        // ...
+    } else {
+        // Normal 모드: 모든 기능 활성
+        // ...
+    }
+}
+```
+
+## 11. UART-HID 브리지 구현 패턴
+
+### 11.1 UART 수신 및 프레임 정렬
+
+```cpp
+#include "driver/uart.h"
+
+#define UART_PORT_NUM UART_NUM_1
+#define UART_TX_PIN 18  // Geekble nano 핀맵 참조
+#define UART_RX_PIN 17
+#define UART_BAUD_RATE 1000000  // 1Mbps
+#define BUF_SIZE 256
+
+// 링버퍼 구현 (프레임 정렬용)
+typedef struct {
+    uint8_t data[BUF_SIZE];
+    size_t head;
+    size_t tail;
+    size_t count;
+} RingBuffer;
+
+/**
+ * @brief UART 초기화 및 핀 설정
+ */
+void uart_bridge_init() {
+    uart_config_t uart_config = {
+        .baud_rate = UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, 
+                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+}
+
+/**
+ * @brief 8바이트 프레임 추출 및 재정렬
+ * 
+ * UART 스트림에서 유효한 8바이트 경계를 찾아 정렬합니다.
+ * 프레임 시작 조건: seq 연속성 또는 keep-alive 플래그
+ */
+bool extractValidFrame(RingBuffer* rb, uint8_t out_frame[8]) {
+    while (rb->count >= 8) {
+        // 8바이트 피크
+        uint8_t temp[8];
+        for (int i = 0; i < 8; i++) {
+            size_t idx = (rb->tail + i) % BUF_SIZE;
+            temp[i] = rb->data[idx];
+        }
+        
+        // 프레임 유효성 검사
+        if (isValidFramePattern(temp)) {
+            // 유효한 프레임 발견 - 추출
+            memcpy(out_frame, temp, 8);
+            rb->tail = (rb->tail + 8) % BUF_SIZE;
+            rb->count -= 8;
+            return true;
+        }
+        
+        // 1바이트 전진하여 재시도
+        rb->tail = (rb->tail + 1) % BUF_SIZE;
+        rb->count--;
+    }
+    return false;
+}
+```
+
+### 11.2 HID 분할 주입 구현
+
+```cpp
+/**
+ * @brief i16 델타를 HID 규격 i8로 분할하여 주입
+ * 
+ * 큰 이동 값을 -127~127 범위로 분할하여 여러 번 전송합니다.
+ * 우선순위: 버튼 > 휠 > 이동
+ */
+void injectHIDFromFrame(const uint8_t frame[8]) {
+    uint8_t buttons = frame[1];
+    int16_t dx = (int16_t)((frame[3] << 8) | frame[2]);
+    int16_t dy = (int16_t)((frame[5] << 8) | frame[4]);
+    int8_t wheel = (int8_t)frame[6];
+    uint8_t flags = frame[7];
+    
+    // 긴급 정지 플래그 체크
+    if (flags & 0x02) {  // EMERGENCY_STOP
+        buttons = 0;
+        dx = dy = wheel = 0;
+    }
+    
+    // 1. 버튼 상태 즉시 반영
+    static uint8_t lastButtons = 0;
+    if (buttons != lastButtons) {
+        tud_hid_mouse_report(0, buttons, 0, 0, 0, 0);
+        lastButtons = buttons;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    
+    // 2. 휠 (Report 모드에서만)
+    if (isReportProtocol && wheel != 0) {
+        tud_hid_mouse_report(0, buttons, 0, 0, wheel, 0);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    
+    // 3. 이동 분할 주입
+    while (dx != 0 || dy != 0) {
+        int8_t stepX = constrain(dx, -127, 127);
+        int8_t stepY = constrain(dy, -127, 127);
+        
+        tud_hid_mouse_report(0, buttons, stepX, stepY, 0, 0);
+        
+        dx -= stepX;
+        dy -= stepY;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+// 유틸리티 함수
+int8_t constrain(int16_t value, int8_t min, int8_t max) {
+    if (value < min) return min;
+    if (value > max) return max;
+    return (int8_t)value;
+}
+```
+
+## 12. Boot/Report Protocol 전환 구현
+
+### 12.1 TinyUSB 콜백 처리
+
+```cpp
+// 전역 프로토콜 상태
+volatile bool isReportProtocol = false;
+volatile bool isBootSafeMode = true;  // 초기값: Boot-safe
+
+/**
+ * @brief HID SET_PROTOCOL 요청 콜백
+ * 
+ * 호스트(BIOS/OS)가 프로토콜 전환을 요청할 때 호출됩니다.
+ * Boot Protocol: BIOS, 로그인 화면
+ * Report Protocol: OS 진입 후
+ */
+uint8_t tud_hid_set_protocol_cb(uint8_t instance, uint8_t protocol) {
+    (void)instance;
+    
+    isReportProtocol = (protocol == HID_PROTOCOL_REPORT);
+    
+    // Report Protocol 전환 = OS 진입으로 간주
+    if (isReportProtocol) {
+        isBootSafeMode = false;
+        ESP_LOGI("HID", "Switched to Report Protocol (Normal mode)");
+    } else {
+        isBootSafeMode = true;
+        ESP_LOGI("HID", "Switched to Boot Protocol (Boot-safe mode)");
+    }
+    
+    return 0;  // Accept
+}
+
+/**
+ * @brief HID GET_REPORT 요청 콜백
+ */
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                               hid_report_type_t report_type, uint8_t* buffer,
+                               uint16_t reqlen) {
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    
+    // 현재 상태 리포트 (필요시 구현)
+    return 0;
+}
+```
+
+### 12.2 프로토콜별 동작 차이 구현
+
+```cpp
+/**
+ * @brief Boot-safe 모드 제약 적용
+ * 
+ * Boot Protocol 또는 Boot-safe 모드에서는:
+ * - 휠 비활성 (wheel = 0)
+ * - 우클릭/중간클릭 비활성
+ * - 매크로/특수 기능 비활성
+ */
+void applyBootSafeConstraints(uint8_t* buttons, int8_t* wheel, uint8_t* flags) {
+    if (isBootSafeMode) {
+        // 좌클릭만 허용
+        *buttons &= 0x01;
+        
+        // 휠 강제 비활성
+        *wheel = 0;
+        
+        // 특수 플래그 제거 (스크롤 모드, 축 스냅 등)
+        *flags &= ~(0x08 | 0x10);  // 비트 3, 4 클리어
+    }
+}
+```
+
+### 12.3 상태 전환 알림 (Android 앱 연동용)
+
+```cpp
+/**
+ * @brief 프로토콜/모드 변경을 UART로 알림
+ * 
+ * Android 앱이 현재 동글 상태를 인지할 수 있도록
+ * 상태 변경 시 특수 프레임을 전송합니다.
+ */
+void notifyModeChange() {
+    uint8_t statusFrame[8] = {0};
+    
+    // 상태 알림 프레임 포맷 (예시)
+    statusFrame[0] = 0xFF;  // 특수 seq (상태 프레임 식별자)
+    statusFrame[1] = isBootSafeMode ? 0x01 : 0x00;
+    statusFrame[2] = isReportProtocol ? 0x01 : 0x00;
+    // ... 추가 상태 정보
+    
+    uart_write_bytes(UART_PORT_NUM, statusFrame, 8);
+}
+```
+
+## 13. 통합 예제: UART-HID 브리지 메인 루프
+
+```cpp
+/**
+ * @brief PCRemote UART-HID 브리지 메인 태스크
+ * 
+ * UART로 8바이트 프레임을 수신하여 USB HID로 변환/주입합니다.
+ * 프레임 정렬, 유효성 검증, 분할 주입을 모두 처리합니다.
+ */
+void uart_hid_bridge_task(void* pvParameters) {
+    RingBuffer rxBuffer = {0};
+    uint8_t tempBuf[BUF_SIZE];
+    uint8_t frame[8];
+    
+    uart_bridge_init();
+    
+    while (1) {
+        // UART 수신
+        int len = uart_read_bytes(UART_PORT_NUM, tempBuf, BUF_SIZE,
+                                  pdMS_TO_TICKS(10));
+        
+        if (len > 0) {
+            // 링버퍼에 추가
+            for (int i = 0; i < len; i++) {
+                rxBuffer.data[(rxBuffer.head + i) % BUF_SIZE] = tempBuf[i];
+            }
+            rxBuffer.head = (rxBuffer.head + len) % BUF_SIZE;
+            rxBuffer.count += len;
+            
+            // 프레임 추출 시도
+            while (extractValidFrame(&rxBuffer, frame)) {
+                // Keep-alive 처리
+                if (frame[7] & 0x01) {
+                    updateLastKeepAlive();
+                    continue;
+                }
+                
+                // Boot-safe 제약 적용
+                uint8_t buttons = frame[1];
+                int8_t wheel = frame[6];
+                uint8_t flags = frame[7];
+                applyBootSafeConstraints(&buttons, &wheel, &flags);
+                
+                // 수정된 프레임으로 HID 주입
+                frame[1] = buttons;
+                frame[6] = wheel;
+                frame[7] = flags;
+                
+                injectHIDFromFrame(frame);
+            }
+        }
+        
+        // Keep-alive 타임아웃 체크
+        checkKeepAliveTimeout();
+        
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+```
+
